@@ -1,0 +1,16 @@
+services:
+  hotspot:
+    build: .
+    image: hotspot:1.0.0
+    container_name: hotspot
+    ports:
+      - "3456:3456"
+    environment:
+      HOTSPOT_PORT: 3456
+      # AI 接口配置可通过 Web 页面修改，也可用环境变量覆盖（占位示例）
+      # HOTSPOT_AI_BASE_URL: https://api.deepseek.com/v1
+      # HOTSPOT_AI_API_KEY: sk-xxxx
+      # HOTSPOT_AI_MODEL: deepseek-chat
+    volumes:
+      - ./data:/app/data   # 数据持久化（快照备份 + 最新数据）
+    restart: unless-stopped

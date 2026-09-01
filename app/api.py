@@ -1,0 +1,253 @@
+"""FastAPI 应用：对外 API + Web UI + 后台调度。
+
+对外 API（供 Firefly 热点榜单模块消费）：
+  GET  /api/hotspot/ai           最新 AI 整理数据（含榜单）
+  GET  /api/hotspot/raw          最新原始数据预览
+  GET  /api/hotspot/cleaned      最新清洗后数据预览
+  GET  /api/hotspot/sources      数据源可用性
+  GET  /api/hotspot/publish      对外发布载荷（Firefly 直接消费）
+  GET  /api/hotspot/health       健康检查
+  GET  /api/hotspot/status       运行状态
+
+控制 API（Web UI 调试使用）：
+  POST /api/hotspot/fetch / clean / ai / run-all
+  GET/PUT /api/hotspot/config
+  GET/PUT /api/hotspot/prompts/{name}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+
+from .config import config_manager
+from .pipeline import pipeline_run_all, run_ai, run_clean, run_fetch, run_state, scheduler_loop
+from .storage import storage
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger("hotspot.api")
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+app = FastAPI(title="HotSpot 热点数据服务", version="1.0.0")
+
+# 允许跨域：供 Firefly 前端直接调用（需求六）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============ 数据查询 API ============
+
+@app.get("/api/hotspot/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "hotspot",
+        "version": "1.0.0",
+        "time": __import__("time").time(),
+    }
+
+
+@app.get("/api/hotspot/status")
+async def status():
+    return run_state()
+
+
+@app.get("/api/hotspot/raw")
+async def get_raw():
+    data = storage.load_latest("raw")
+    if not data:
+        raise HTTPException(404, "暂无原始数据，请先在 Web 页面点击【获取数据】")
+    return JSONResponse(data)
+
+
+@app.get("/api/hotspot/cleaned")
+async def get_cleaned():
+    data = storage.load_latest("cleaned")
+    if not data:
+        raise HTTPException(404, "暂无清洗后数据，请先执行【数据清洗】")
+    return JSONResponse(data)
+
+
+@app.get("/api/hotspot/ai")
+async def get_ai():
+    """最新 AI 整理数据（含总榜 + 各领域榜单）。Firefly 可消费此接口。"""
+    data = storage.load_latest("ai")
+    if not data:
+        raise HTTPException(404, "暂无 AI 整理数据，请先在配置中填写 API 密钥并点击【AI 整理】")
+    return JSONResponse(data)
+
+
+@app.get("/api/hotspot/publish")
+async def get_publish():
+    """对外发布载荷（Firefly 热点榜单模块直接消费）。"""
+    data = storage.load_latest("publish") or storage.load_latest("ai")
+    if not data:
+        raise HTTPException(404, "暂无已发布数据")
+    return JSONResponse(data)
+
+
+@app.get("/api/hotspot/sources")
+async def get_sources():
+    """数据源可用性（需求二）。"""
+    latest = storage.load_latest("ai") or storage.load_latest("raw")
+    sources = (latest or {}).get("sources", [])
+    if not sources:
+        sources = []
+    return JSONResponse({"updatedAt": (latest or {}).get("fetchedAt", 0), "sources": sources})
+
+
+# ============ 控制 API ============
+
+@app.post("/api/hotspot/fetch")
+async def api_fetch(force: bool = Body(default=False, embed=True)):
+    try:
+        snapshot = await run_fetch(force=force)
+        return {"ok": True, "runId": snapshot.runId,
+                "items": len(snapshot.items), "sources": len(snapshot.sources)}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/hotspot/clean")
+async def api_clean():
+    try:
+        cleaned = await run_clean()
+        return {"ok": True, "runId": cleaned.get("runId"), "items": len(cleaned.get("items", []))}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/hotspot/ai")
+async def api_ai():
+    """触发 AI 整理：自动存储 + 发布到 API（需求六-2）。"""
+    try:
+        result = await run_ai()
+        return {"ok": True, "runId": result.get("runId"), "total": result.get("total")}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/hotspot/run-all")
+async def api_run_all(force: bool = Body(default=False, embed=True)):
+    try:
+        await pipeline_run_all(force=force)
+        return {"ok": True}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+# ============ 配置与提示词 API ============
+
+# 密钥脱敏占位符：GET /config 返回该值，PUT 时检测到则保留原有密钥，避免掩码回写破坏密钥
+MASKED_KEY_SENTINEL = "__HOTSPOT_MASKED__"
+
+
+def _mask_config(cfg: dict) -> dict:
+    masked = {k: (dict(v) if isinstance(v, dict) else v) for k, v in cfg.items()}
+    ai = masked.get("ai")
+    if ai and ai.get("apiKey"):
+        key = str(ai["apiKey"])
+        ai["apiKey"] = key[:4] + "…" + key[-4:] if len(key) > 8 else "***"
+    return masked
+
+
+def _preserve_real_key(base: dict, incoming: dict) -> dict:
+    """PUT 配置时保护 API 密钥：incoming 为脱敏值/占位符时，沿用已保存的真实密钥。
+
+    修复：Web 页面「配置」标签页展示的是打码后的密钥，若用户原样保存，掩码值
+    会覆盖真实密钥，导致 AI 请求携带含 U+2026（…）的 Authorization 头而触发
+    ascii 编码错误。
+    """
+    ai_in = incoming.get("ai")
+    if not isinstance(ai_in, dict) or not isinstance(base.get("ai"), dict):
+        return incoming
+    incoming_key = ai_in.get("apiKey")
+    real_key = base["ai"].get("apiKey", "")
+    if incoming_key in (MASKED_KEY_SENTINEL, "") or (isinstance(incoming_key, str) and "…" in incoming_key):
+        ai_in["apiKey"] = real_key
+    return incoming
+
+
+@app.get("/api/hotspot/config")
+async def get_config():
+    cfg = config_manager.get()
+    ai = cfg.get("ai", {})
+    # 返回脱敏配置（密钥打码，便于页面展示）
+    return JSONResponse(_mask_config(cfg))
+
+
+@app.put("/api/hotspot/config")
+async def put_config(payload: dict = Body(...)):
+    try:
+        # 保护密钥：若提交的是脱敏掩码值，则沿用已保存的真实密钥
+        current = config_manager.get()
+        payload = _preserve_real_key(current, payload)
+        cfg = config_manager.update(payload)
+        return {"ok": True, "config": _mask_config(cfg)}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/api/hotspot/prompts")
+async def list_prompts():
+    return {"prompts": config_manager.list_prompts()}
+
+
+@app.get("/api/hotspot/prompts/{name}")
+async def get_prompt(name: str):
+    content = config_manager.get_prompt(name)
+    if content is None or (not content and name not in ("system_prompt", "finalize_prompt")):
+        raise HTTPException(404, "提示词不存在")
+    return PlainTextResponse(content)
+
+
+@app.put("/api/hotspot/prompts/{name}")
+async def put_prompt(name: str, request: Request):
+    content = (await request.body()).decode("utf-8")
+    try:
+        config_manager.save_prompt(name, content)
+        return {"ok": True}
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+# ============ 历史快照 API ============
+
+@app.get("/api/hotspot/history/{kind}")
+async def history(kind: str):
+    if kind not in ("raw", "cleaned", "ai"):
+        raise HTTPException(400, "kind 必须为 raw/cleaned/ai")
+    return {"snapshots": storage.list_snapshots(kind)}
+
+
+# ============ Web UI ============
+
+@app.get("/", include_in_schema=False)
+async def index():
+    return FileResponse(WEB_DIR / "index.html")
+
+
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+# ============ 启动 ============
+
+@app.on_event("startup")
+async def startup():
+    config_manager.load()
+    # 同步一次最新发布（若已有 AI 数据）
+    from .pipeline import publish_latest
+
+    publish_latest()
+    asyncio.create_task(scheduler_loop())
