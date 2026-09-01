@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-zaobao",
+  "name": "联合早报即时新闻",
+  "type": "rsshub",
+  "domain": "国际",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/zaobao/realtime/china"
+  },
+  "template": null,
+  "description": "联合早报即时新闻-中国（可换 world/singapore 等）"
+}

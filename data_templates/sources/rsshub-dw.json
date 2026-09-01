@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-dw",
+  "name": "德国之声新闻",
+  "type": "rsshub",
+  "domain": "国际",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/dw/news"
+  },
+  "template": null,
+  "description": "德国之声 DW 新闻（默认中文，可加 /en 等语言参数）"
+}

@@ -1,0 +1,135 @@
+[
+  {
+    "url": "https://rsshub.app",
+    "name": "官方实例",
+    "location": "美国",
+    "maintainer": "RSSHub 官方 (DIYgod)",
+    "online": true
+  },
+  {
+    "url": "https://rsshub.rssforever.com",
+    "name": "RSSForever 实例",
+    "location": "阿联酋",
+    "maintainer": "Stille",
+    "online": false
+  },
+  {
+    "url": "https://hub.slarker.me",
+    "name": "Slarker 实例",
+    "location": "美国",
+    "maintainer": "Slarker",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.pseudoyu.com",
+    "name": "Pseudoyu 实例",
+    "location": "法国",
+    "maintainer": "pseudoyu",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.rss.tips",
+    "name": "AboutRSS 实例",
+    "location": "美国",
+    "maintainer": "AboutRSS",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.ktachibana.party",
+    "name": "KTachibana 实例",
+    "location": "美国",
+    "maintainer": "KTachibanaM",
+    "online": false
+  },
+  {
+    "url": "https://rss.owo.nz",
+    "name": "OwO 实例",
+    "location": "德国",
+    "maintainer": "Vincent Yang",
+    "online": false
+  },
+  {
+    "url": "https://rss.wudifeixue.com",
+    "name": "无地飞雪实例",
+    "location": "加拿大",
+    "maintainer": "wudifeixue",
+    "online": false
+  },
+  {
+    "url": "https://rss.littlebaby.life/rsshub",
+    "name": "LittleBaby 实例",
+    "location": "美国",
+    "maintainer": "yuanhong",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.henry.wang",
+    "name": "Henry 实例",
+    "location": "英国",
+    "maintainer": "HenryQW",
+    "online": false
+  },
+  {
+    "url": "https://holoxx.f5.si",
+    "name": "Holoxx 实例",
+    "location": "日本",
+    "maintainer": "Vania",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.umzzz.com",
+    "name": "Umzzz 实例",
+    "location": "香港",
+    "maintainer": "nesay",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.isrss.com",
+    "name": "isRSS 实例",
+    "location": "美国",
+    "maintainer": "isRSS",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.email-once.com",
+    "name": "EmailOnce 实例",
+    "location": "香港",
+    "maintainer": "EmailOnce",
+    "online": false
+  },
+  {
+    "url": "https://rss.datuan.dev",
+    "name": "Duan 实例",
+    "location": "越南",
+    "maintainer": "Tuấn Dev",
+    "online": false
+  },
+  {
+    "url": "https://rss.4040940.xyz",
+    "name": "TingyuShare 实例",
+    "location": "德国",
+    "maintainer": "TingyuShare",
+    "online": false
+  },
+  {
+    "url": "https://rsshub.cups.moe",
+    "name": "Cups 实例",
+    "location": "美国",
+    "maintainer": "FunnyCups",
+    "online": false
+  },
+  {
+    "url": "https://rss.spriple.org",
+    "name": "Spriple 实例",
+    "location": "中国大陆",
+    "maintainer": "Spriple",
+    "online": false
+  },
+  {
+    "url": "https://rsshub-balancer.virworks.moe",
+    "name": "VirWorks 负载均衡实例",
+    "location": "未知",
+    "maintainer": "chesha1",
+    "online": false
+  }
+]

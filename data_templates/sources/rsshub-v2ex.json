@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-v2ex",
+  "name": "V2EX 最热主题",
+  "type": "rsshub",
+  "domain": "互联网",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/v2ex/topics/hot"
+  },
+  "template": null,
+  "description": "V2EX 最热主题（latest 为最新）"
+}

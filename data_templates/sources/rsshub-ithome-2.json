@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-ithome-2",
+  "name": "IT之家热榜",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/ithome/ranking/24h"
+  },
+  "template": null,
+  "description": "IT之家 24 小时热榜"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-arxiv",
+  "name": "arXiv 论文",
+  "type": "rsshub",
+  "domain": "学术",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/arxiv/search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending"
+  },
+  "template": null,
+  "description": "arXiv 最新论文（cs.AI 分类，可按需改查询参数）"
+}

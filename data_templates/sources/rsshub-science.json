@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-science",
+  "name": "Science 最新一期",
+  "type": "rsshub",
+  "domain": "科学",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/science/current"
+  },
+  "template": null,
+  "description": "Science 杂志最新一期文章（另有 /early 先发论文）"
+}

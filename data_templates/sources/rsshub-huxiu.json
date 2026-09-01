@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-huxiu",
+  "name": "虎嗅 24 小时",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/huxiu/moment"
+  },
+  "template": null,
+  "description": "虎嗅 24 小时资讯流"
+}

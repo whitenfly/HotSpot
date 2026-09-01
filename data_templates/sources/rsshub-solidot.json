@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-solidot",
+  "name": "Solidot 最新消息",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/solidot"
+  },
+  "template": null,
+  "description": "Solidot 科技资讯（可加 /linux、/science 等分类）"
+}

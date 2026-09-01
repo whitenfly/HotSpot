@@ -132,10 +132,20 @@ async def fetch_rsshub(
     timeout: float = 20.0,
     instances: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """依次尝试各 RSSHub 实例，首个成功返回即停止。参考 WhatsHot utils/rsshub.py。"""
-    bases = instances or DEFAULT_RSSHUB_INSTANCES
+    """依次尝试各 RSSHub 实例，首个成功返回即停止。参考 WhatsHot utils/rsshub.py。
+
+    实例尝试顺序（需求：上次成功实例优先）：
+    1. 路由级"成功实例"记忆（该 path 上次测试联通/获取成功的实例，来自 rsshub_manager）
+    2. 已标记 online 的全局实例
+    3. 全部全局实例（或配置指定的 instances）
+    记忆实例抓取成功则刷新记忆；失败则清除该条记忆并继续尝试其他实例。
+    另跳过返回 "# Looks like something went wrong" 等错误页的实例（实例在线但路由无数据）。
+    """
+    from ..rsshub_manager import rsshub_instances
+
+    candidates = _rsshub_instance_order(path, instances)
     last_error = ""
-    for base in bases:
+    for base in candidates:
         base = base.rstrip("/")
         url = f"{base}{path}?format=json&limit={limit}"
         try:
@@ -146,13 +156,70 @@ async def fetch_rsshub(
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
+            if _is_rsshub_error_page(data):
+                last_error = f"[RSSHub] 实例 {base} 路由无数据（错误页）"
+                continue
             items = _rsshub_items(data, limit)
             if items:
+                # 抓取成功：记录该路由的成功实例
+                rsshub_instances.set_success_instance(path, base)
                 return items
             last_error = f"[RSSHub] 实例 {base} 解析结果为空"
         except Exception as exc:  # noqa: BLE001 - 故障转移需要吞掉单个实例错误
             last_error = f"[RSSHub] {base} 失败: {exc}"
+    # 全部实例失败：若记忆实例是最后尝试的（且失败），清除记忆避免下次重复
+    remembered = rsshub_instances.get_success_instance(path)
+    if remembered:
+        rsshub_instances.clear_success_instance(path)
     raise FetchError(last_error or "[RSSHub] 所有实例均失败")
+
+
+def _rsshub_instance_order(path: str, instances: list[str] | None) -> list[str]:
+    """构建实例尝试顺序：记忆实例 → online 实例 → 全部实例（去重）。"""
+    from ..rsshub_manager import rsshub_instances
+
+    if instances:
+        ordered: list[str] = []
+        remembered = rsshub_instances.get_success_instance(path)
+        if remembered:
+            ordered.append(remembered)
+        for inst in instances:
+            inst = inst.rstrip("/")
+            if inst not in ordered:
+                ordered.append(inst)
+        return ordered
+
+    ordered = []
+    remembered = rsshub_instances.get_success_instance(path)
+    if remembered:
+        ordered.append(remembered)
+    for inst in rsshub_instances.online_urls() + rsshub_instances.list_instance_urls():
+        inst = inst.rstrip("/")
+        if inst not in ordered:
+            ordered.append(inst)
+    return ordered
+
+
+def _is_rsshub_error_page(data: Any) -> bool:
+    """识别 RSSHub 返回的"Looks like something went wrong"错误页。
+
+    此时实例本身可用，但该路由在该实例上无数据或出错；
+    返回 JSON 格式（?format=json）时可能表现为 items 为空 + 特定 title，
+    或 HTML 错误页文本。
+    """
+    if isinstance(data, dict):
+        title = str(data.get("title") or "")
+        message = str(data.get("message") or "")
+        text = f"{title} {message}"
+        return any(marker in text for marker in (
+            "Looks like something went wrong",
+            "Something went wrong",
+            "Internal Server Error",
+            "404 Not Found",
+        ))
+    if isinstance(data, str):
+        return "Looks like something went wrong" in data
+    return False
 
 
 def _rsshub_items(data: Any, limit: int) -> list[dict[str, Any]]:

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-gamersky",
+  "name": "游民星空资讯",
+  "type": "rsshub",
+  "domain": "游戏",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/gamersky/news"
+  },
+  "template": null,
+  "description": "游民星空游戏资讯（可加 /pc、/mobile 等类型）"
+}

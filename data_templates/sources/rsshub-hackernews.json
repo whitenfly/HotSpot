@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-hackernews",
+  "name": "Hacker News",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/hackernews"
+  },
+  "template": null,
+  "description": "Hacker News 首页故事"
+}

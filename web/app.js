@@ -9,7 +9,7 @@
 const API = '/api/hotspot';
 const POLL_INTERVAL = 10000;                       // 自动刷新周期：10s
 
-const TABS = ['raw', 'cleaned', 'ai', 'sources', 'config', 'prompts'];
+const TABS = ['raw', 'cleaned', 'ai', 'sources', 'config', 'prompts', 'manage'];
 const DATA_TABS = ['raw', 'cleaned', 'ai', 'sources'];   // 参与自动刷新的数据标签
 const TAB_LABEL = {
   raw: '原始数据',
@@ -18,9 +18,10 @@ const TAB_LABEL = {
   sources: '数据源可用性',
   config: '配置',
   prompts: '提示词',
+  manage: '数据源',
 };
 // 各标签「内容容器」的后缀（用于空态时隐藏内容）
-const STATE_SUFFIX = { raw: 'TableWrap', cleaned: 'TableWrap', ai: 'Content', sources: 'TableWrap' };
+const STATE_SUFFIX = { raw: 'TableWrap', cleaned: 'TableWrap', ai: 'Content', sources: 'TableWrap', manage: 'List' };
 
 /* ---------------- DOM 快捷方式 ---------------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -147,6 +148,21 @@ const state = {
   },
   aiCategory: '',
   prompt: { file: null, apiName: null, original: '', dirty: false },
+  manage: {
+    editing: null,          // null=表单关闭；'new'=新增；其他=编辑中的源 id
+    editorOriginal: '',     // 表单打开时的字段快照（取消时检测未保存修改）
+    test: {},               // 源 id -> { loading, open, data, error, rawExpanded }
+    fetch: {},              // 源 id -> { loading, data, error, sourceCount }
+    filter: '',             // 领域筛选（'' = 全部）
+    toggle: {},             // 源 id -> { loading }（启停切换请求进行中）
+    rsshub: {
+      instances: null,      // null=未加载；数组=已加载实例列表
+      loading: false,       // 实例列表请求进行中
+      error: null,          // 列表加载错误（无数据时行内展示）
+      testing: {},          // 实例 url -> true（该实例测试进行中）
+      testingAll: false,    // 「全部测试」顺序执行中
+    },
+  },
 };
 TABS.forEach((t) => { state.data[t] = null; state.dirty[t] = true; });
 
@@ -310,6 +326,7 @@ const LOADERS = {
   sources: makeLoader('sources', renderSources),
   config: makeLoader('config', renderConfig),
   prompts: makeLoader('prompts', renderPromptsList),
+  manage: loadManage,
 };
 
 /** 标签内容区状态（加载中 / 空 / 错误）；config 与 prompts 无状态容器，自动跳过 */
@@ -700,6 +717,613 @@ function updatePromptDirty() {
   byId('promptDirty').hidden = !dirty;
 }
 
+/* ---------------- 数据源管理 ---------------- */
+
+/** 测试联通：原始响应预览的截断长度（字符） */
+const RAW_PREVIEW_LIMIT = 2000;
+/** 解析结果预览最多展示条数 */
+const ITEMS_PREVIEW_LIMIT = 10;
+/** 数据源 id 合法字符集（与后端校验一致） */
+const SRC_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+async function loadManage(opts = {}) {
+  const { force = false, silent = false } = opts;
+  if (state.busy) return;
+  loadRsshubInstances();                       // RSSHub 实例列表独立加载（内部缓存，失败互不影响）
+  const hasData = state.data.manage != null;
+  if (!force && hasData && !state.dirty.manage) { renderManage(); return; }
+  if (!silent || !hasData) showTabState('manage', 'loading');
+  try {
+    state.data.manage = await getJson(API + '/sources/config');
+    state.dirty.manage = false;
+    renderSrcFilter();
+    renderManage();
+  } catch (e) {
+    if (e.status === 404) {
+      state.data.manage = null;
+      state.dirty.manage = false;
+      state.manage.filter = '';
+      byId('srcFilterBar').hidden = true;
+      showTabState('manage', 'empty', e.body || '暂无数据源配置');
+    } else {
+      if (!hasData) showTabState('manage', 'error', e.message);
+      if (!silent) showBanner('加载数据源失败：' + e.message);
+    }
+  }
+}
+
+function findSource(id) {
+  const d = state.data.manage;
+  return (Array.isArray(d && d.sources) ? d.sources : []).find((s) => s.id === id) || null;
+}
+
+/** 数据源领域（空值归一为「综合」，与卡片徽章展示一致） */
+function srcDomain(s) { return s.domain || '综合'; }
+
+function renderManage() {
+  const d = state.data.manage;
+  const list = Array.isArray(d && d.sources) ? d.sources : [];
+  const editorOpen = state.manage.editing != null;
+  byId('srcEditor').hidden = !editorOpen;
+
+  if (!list.length && !editorOpen) {
+    showTabState('manage', 'empty', '点击右上角「新增数据源」创建第一个数据源');
+    byId('srcFilterBar').hidden = true;
+    return;
+  }
+  byId('manageState').hidden = true;
+  byId('manageList').hidden = false;
+  byId('srcFilterBar').hidden = !list.length;
+
+  const enabled = list.filter((s) => s.enabled !== false).length;
+  byId('manageStats').innerHTML = [
+    statHtml('总源数', fmtNum(list.length)),
+    statHtml('启用', fmtNum(enabled)),
+  ].join('');
+
+  // 领域筛选：仅过滤卡片网格，测试面板 / 编辑表单等其他状态不受影响
+  const filter = state.manage.filter;
+  const shown = filter ? list.filter((s) => srcDomain(s) === filter) : list;
+  byId('srcFilterCount').textContent = '共 ' + shown.length + ' 个源';
+  byId('manageList').innerHTML = shown.map(srcCardHtml).join('');
+}
+
+/** 重建领域筛选下拉选项（仅数据变化时调用）；当前筛选已失效时回退「全部」 */
+function renderSrcFilter() {
+  const d = state.data.manage;
+  const list = Array.isArray(d && d.sources) ? d.sources : [];
+  const domains = Array.from(new Set(list.map(srcDomain)))
+    .sort((a, b) => a.localeCompare(b, 'zh'));
+  if (state.manage.filter && !domains.includes(state.manage.filter)) state.manage.filter = '';
+  const sel = byId('srcDomainFilter');
+  sel.innerHTML = ['<option value="">全部</option>']
+    .concat(domains.map((dm) => '<option value="' + esc(dm) + '">' + esc(dm) + '</option>'))
+    .join('');
+  sel.value = state.manage.filter;
+}
+
+function srcCardHtml(s) {
+  const id = String(s.id == null ? '' : s.id);
+  const enabled = s.enabled !== false;
+  const t = state.manage.test[id] || null;
+  const f = state.manage.fetch[id] || null;
+  const g = state.manage.toggle[id] || null;
+  const testing = !!(t && t.loading);
+  const fetching = !!(f && f.loading);
+  const toggling = !!(g && g.loading);
+  const name = s.name == null ? id : s.name;
+
+  const badges = [
+    '<span class="badge src-type" title="数据源类型">' + esc(s.type || '—') + '</span>',
+    '<span class="chip" title="领域">' + esc(srcDomain(s)) + '</span>',
+  ];
+  if (s.template) badges.push('<span class="badge badge-info" title="已配置解析模板">模板</span>');
+
+  // 头部启停开关：点击即时切换（不打开编辑表单），请求期间禁用防连点
+  const toggleHtml =
+    '<label class="switch src-toggle' + (toggling ? ' switching' : '') + '" title="' +
+      (enabled ? '点击禁用该数据源（即时生效）' : '点击启用该数据源（即时生效）') + '">' +
+      '<input type="checkbox" data-act="toggle"' + (enabled ? ' checked' : '') + (toggling ? ' disabled' : '') + '>' +
+      '<span class="switch-track"><span class="switch-knob"></span></span>' +
+      '<span class="switch-label">' + (enabled ? '启用' : '禁用') + '</span>' +
+    '</label>';
+
+  return '<article class="src-card' + (t && t.open ? ' expanded' : '') + (enabled ? '' : ' is-disabled') +
+    '" data-id="' + esc(id) + '">' +
+    '<div class="src-card-head">' +
+      '<div class="src-card-title">' +
+        '<span class="src-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
+        badges.join('') +
+      '</div>' +
+      toggleHtml +
+    '</div>' +
+    '<div class="src-card-sub">' + esc(id) + '</div>' +
+    '<div class="src-card-meta">' +
+      '<span>条数上限 <span class="src-meta-v">' + fmtNum(s.limit) + '</span></span>' +
+      '<span>最小间隔 <span class="src-meta-v">' + fmtNum(s.minIntervalMinutes) + '</span> 分钟</span>' +
+      '<span>超时 <span class="src-meta-v">' + fmtNum(s.timeoutSeconds) + '</span> 秒</span>' +
+      (s.description ? '<span class="src-meta-desc" title="' + esc(s.description) + '">' + esc(s.description) + '</span>' : '') +
+    '</div>' +
+    '<div class="src-card-actions">' +
+      '<button type="button" class="btn btn-sm' + (testing ? ' loading' : '') + '" data-act="test"' + (testing ? ' disabled' : '') + '><span class="btn-spin" aria-hidden="true"></span><span>测试联通</span></button>' +
+      '<button type="button" class="btn btn-sm' + (fetching ? ' loading' : '') + '" data-act="fetchone"' + (fetching ? ' disabled' : '') + '><span class="btn-spin" aria-hidden="true"></span><span>单独获取</span></button>' +
+      '<button type="button" class="btn btn-sm" data-act="edit"><span>编辑</span></button>' +
+      '<button type="button" class="btn btn-sm btn-danger" data-act="delete"><span class="btn-spin" aria-hidden="true"></span><span>删除</span></button>' +
+    '</div>' +
+    (f ? srcFetchHtml(f) : '') +
+    (t && t.open ? srcTestHtml(t) : '') +
+    '</article>';
+}
+
+function srcFetchHtml(f) {
+  if (f.loading) {
+    return '<div class="src-fetch-res is-loading"><span class="spinner" aria-hidden="true"></span>' +
+      '<span>正在单独获取并并入最近快照…</span></div>';
+  }
+  if (f.error) {
+    return '<div class="src-fetch-res is-err"><span class="badge badge-err">单独获取失败</span>' +
+      '<span class="src-fetch-text">' + esc(f.error) + '</span></div>';
+  }
+  const d = f.data || {};
+  return '<div class="src-fetch-res">' +
+    '<span class="badge badge-ok">已并入快照</span>' +
+    '<span class="src-fetch-text">合并后总条数 <span class="src-meta-v">' + fmtNum(d.items) + '</span>' +
+    ' · 本源条数 <span class="src-meta-v">' + fmtNum(f.sourceCount) + '</span>' +
+    ' · ' + (d.partial ? '部分合并（仅更新该源数据）' : '完整快照') + '</span></div>';
+}
+
+function srcTestHtml(t) {
+  if (t.loading) {
+    return '<div class="src-test"><div class="src-test-loading">' +
+      '<span class="spinner" aria-hidden="true"></span><span>正在测试联通，抓取并解析中…</span></div></div>';
+  }
+  if (t.error) {
+    return '<div class="src-test">' +
+      '<div class="src-test-head"><span class="badge badge-err">✗ 测试失败</span>' +
+      '<button type="button" class="btn btn-sm src-test-close" data-act="close-test">收起</button></div>' +
+      '<div class="src-test-error">' + esc(t.error) + '</div></div>';
+  }
+
+  const d = t.data || {};
+  const ok = d.connected === true;
+  const raw = d.rawPreview == null ? '' : String(d.rawPreview);
+  const over = raw.length > RAW_PREVIEW_LIMIT;
+  const shown = (t.rawExpanded || !over) ? raw : raw.slice(0, RAW_PREVIEW_LIMIT);
+  const total = Array.isArray(d.itemsPreview) ? d.itemsPreview.length : 0;
+  const items = Array.isArray(d.itemsPreview) ? d.itemsPreview.slice(0, ITEMS_PREVIEW_LIMIT) : [];
+
+  let html = '<div class="src-test">' +
+    '<div class="src-test-head">' +
+      (ok ? '<span class="badge badge-ok">✓ 联通成功</span>' : '<span class="badge badge-err">✗ 联通失败</span>') +
+      '<span class="src-test-meta">' +
+        '<span>耗时 <span class="src-meta-v">' + fmtNum(d.durationMs) + '</span> ms</span>' +
+        '<span>获取于 ' + fmtTime(d.fetchedAt) + '</span>' +
+        (d.template ? '<span>解析模板 <span class="src-meta-v">' + esc(d.template.type || '—') + '</span></span>' : '') +
+      '</span>' +
+      '<button type="button" class="btn btn-sm src-test-close" data-act="close-test">收起</button>' +
+    '</div>';
+  if (d.error) html += '<div class="src-test-error">' + esc(d.error) + '</div>';
+
+  html += '<div class="src-sec">' +
+    '<div class="src-sec-head"><span class="src-sec-title">原始响应预览</span>' +
+      (over ? '<button type="button" class="btn btn-sm" data-act="toggle-raw">' +
+        (t.rawExpanded ? '收起' : '展开全部（共 ' + fmtNum(raw.length) + ' 字符）') + '</button>' : '') +
+    '</div>' +
+    '<pre class="src-pre">' + (esc(shown) || '<span class="faint">（空响应）</span>') + '</pre>' +
+    '</div>';
+
+  html += '<div class="src-sec">' +
+    '<div class="src-sec-head"><span class="src-sec-title">解析结果预览（共 ' + fmtNum(total) + ' 条' +
+      (total > items.length ? '，展示前 ' + items.length + ' 条' : '') + '）</span></div>';
+  if (!items.length) {
+    html += '<div class="src-empty-mini">未解析出条目（请检查模板配置或响应格式）</div>';
+  } else {
+    html += '<div class="table-wrap table-flat src-items-wrap"><table><thead><tr>' +
+      '<th class="td-title">标题</th><th>链接</th><th class="td-num">热度</th>' +
+      '<th class="td-num">发布时间</th><th>摘要</th><th>extra</th>' +
+      '</tr></thead><tbody>' + items.map(srcTestRowHtml).join('') + '</tbody></table></div>';
+  }
+  html += '</div></div>';
+  return html;
+}
+
+function srcTestRowHtml(it) {
+  const url = safeUrl(it && it.url);
+  const extra = it && it.extra;
+  const extraTxt = (extra == null || extra === '') ? '' :
+    (typeof extra === 'string' ? extra : JSON.stringify(extra));
+  return '<tr>' +
+    '<td class="td-trunc td-title" title="' + esc(it && it.title) + '">' + esc((it && it.title) || '—') + '</td>' +
+    '<td class="td-link">' + (url
+      ? '<a class="link" href="' + esc(url) + '" target="_blank" rel="noopener">原文</a>'
+      : '<span class="faint td-trunc" title="' + esc(it && it.url) + '">' + esc((it && it.url) || '—') + '</span>') + '</td>' +
+    '<td class="td-num">' + esc(fmtHeat(it)) + '</td>' +
+    '<td class="td-num">' + fmtTime(it && it.publishedAt) + '</td>' +
+    '<td class="td-trunc" title="' + esc(it && it.summary) + '">' + esc((it && it.summary) || '—') + '</td>' +
+    '<td class="td-trunc td-extra mono" title="' + esc(extraTxt) + '">' +
+      (extraTxt ? esc(extraTxt) : '<span class="faint">—</span>') + '</td>' +
+    '</tr>';
+}
+
+async function testSource(id) {
+  state.manage.test[id] = { loading: true, open: true, data: null, error: null, rawExpanded: false };
+  renderManage();
+  const t = state.manage.test[id];
+  try {
+    t.data = await request(API + '/sources/test/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }).then((r) => r.json());
+  } catch (e) {
+    t.error = e.message;
+  } finally {
+    t.loading = false;
+    renderManage();
+  }
+}
+
+async function fetchSource(id) {
+  state.manage.fetch[id] = { loading: true, data: null, error: null, sourceCount: null };
+  renderManage();
+  const f = state.manage.fetch[id];
+  try {
+    const res = await request(API + '/sources/fetch/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: true }),
+    }).then((r) => r.json());
+    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 500);
+    f.data = res;
+    markDirty('raw', 'sources');
+    // 单独获取接口不返回分源计数，从数据源可用性接口补取该源最新条数
+    try {
+      const avail = await getJson(API + '/sources');
+      const st = (avail && Array.isArray(avail.sources) ? avail.sources : []).find((x) => x.source === id);
+      f.sourceCount = st ? countOf(st.itemCount) : null;
+    } catch (_) { /* 可用性查询失败不影响主结果展示 */ }
+    toast('已并入最近快照，可继续执行数据清洗 / AI 整理');
+  } catch (e) {
+    f.error = e.message;
+  } finally {
+    f.loading = false;
+    renderManage();
+  }
+}
+
+async function deleteSource(id, btn) {
+  const src = findSource(id);
+  const name = src && src.name ? src.name : id;
+  if (!window.confirm('确定删除数据源「' + name + '」（' + id + '）？删除后不可恢复。')) return;
+  btn.disabled = true;
+  btn.classList.add('loading');
+  try {
+    const res = await request(API + '/sources/config/' + encodeURIComponent(id), { method: 'DELETE' })
+      .then((r) => r.json());
+    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 400);
+    delete state.manage.test[id];
+    delete state.manage.fetch[id];
+    delete state.manage.toggle[id];
+    if (state.manage.editing === id) state.manage.editing = null;
+    toast('数据源已删除：' + id);
+    await loadManage({ force: true });
+  } catch (e) {
+    showBanner('删除数据源失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+  }
+}
+
+/** 卡片启停开关：POST toggle 即时切换启用状态，成功后同步本地 state 与编辑表单 */
+async function toggleSource(id) {
+  if (state.manage.toggle[id] && state.manage.toggle[id].loading) return;   // 防连点
+  state.manage.toggle[id] = { loading: true };
+  renderManage();
+  try {
+    const res = await request(API + '/sources/config/' + encodeURIComponent(id) + '/toggle', {
+      method: 'POST',
+    }).then((r) => r.json());
+    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 500);
+    const src = findSource(id);
+    if (src) {
+      src.enabled = res.enabled === true;
+      toast((src.enabled ? '已启用 ' : '已禁用 ') + (src.name || id));
+      // 编辑表单正开着该源时同步 enabled 复选框；表单原本干净则快照一并刷新，避免误报未保存
+      if (state.manage.editing === id) {
+        const wasClean = srcEditorSnapshot() === state.manage.editorOriginal;
+        byId('srcEnabled').checked = src.enabled;
+        if (wasClean) state.manage.editorOriginal = srcEditorSnapshot();
+      }
+    }
+  } catch (e) {
+    showBanner('切换启用状态失败：' + e.message);
+  } finally {
+    state.manage.toggle[id].loading = false;
+    renderManage();
+  }
+}
+
+/** 源卡片内启停开关的 change 事件委托（与 onManageListClick 的按钮委托并列） */
+function onManageListChange(e) {
+  const input = e.target.closest('input[data-act="toggle"]');
+  if (!input || input.disabled) return;
+  const card = input.closest('.src-card');
+  const id = card ? card.dataset.id : '';
+  if (id) toggleSource(id);
+}
+
+function srcEditorSnapshot() {
+  return JSON.stringify([
+    byId('srcId').value, byId('srcName').value, byId('srcType').value,
+    byId('srcDomain').value, byId('srcEnabled').checked,
+    byId('srcLimit').value, byId('srcInterval').value, byId('srcTimeout').value,
+    byId('srcConfig').value, byId('srcTemplate').value,
+  ]);
+}
+
+function openSrcEditor(id) {
+  const isNew = id == null;
+  const s = isNew ? null : findSource(id);
+  if (!isNew && !s) { toast('数据源不存在：' + id, 'warn'); return; }
+  state.manage.editing = isNew ? 'new' : id;
+
+  byId('srcEditorTitle').textContent = isNew ? '新增数据源' : '编辑数据源';
+  const idInput = byId('srcId');
+  idInput.value = isNew ? '' : String(s.id);
+  idInput.readOnly = !isNew;
+  byId('srcName').value = isNew ? '' : (s.name || '');
+  byId('srcType').value = isNew ? 'rss' : (s.type || 'rss');
+  byId('srcDomain').value = isNew ? '综合' : (s.domain || '综合');
+  byId('srcEnabled').checked = isNew ? true : s.enabled !== false;
+  byId('srcLimit').value = isNew ? '30' : (s.limit == null ? '' : s.limit);
+  byId('srcInterval').value = isNew ? '10' : (s.minIntervalMinutes == null ? '' : s.minIntervalMinutes);
+  byId('srcTimeout').value = isNew ? '15' : (s.timeoutSeconds == null ? '' : s.timeoutSeconds);
+  byId('srcConfig').value = JSON.stringify(isNew ? { url: '' } : (s.config || {}), null, 2);
+  byId('srcTemplate').value = s && s.template ? JSON.stringify(s.template, null, 2) : '';
+  state.manage.editorOriginal = srcEditorSnapshot();
+
+  renderManage();
+  byId('srcEditor').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function cancelSrcEditor() {
+  if (state.manage.editing != null && srcEditorSnapshot() !== state.manage.editorOriginal &&
+      !window.confirm('表单有未保存的修改，确定放弃？')) return;
+  state.manage.editing = null;
+  renderManage();
+}
+
+async function saveSrcEditor() {
+  const isNew = state.manage.editing === 'new';
+  const editId = state.manage.editing;
+  const btn = byId('srcSave');
+
+  const id = byId('srcId').value.trim();
+  if (isNew && !SRC_ID_RE.test(id)) {
+    showBanner('数据源 id 仅允许字母 / 数字 / - / _，长度 1-64 位');
+    byId('srcId').focus();
+    return;
+  }
+  const name = byId('srcName').value.trim();
+  if (!name) {
+    showBanner('数据源名称不能为空');
+    byId('srcName').focus();
+    return;
+  }
+
+  let config;
+  try {
+    config = JSON.parse(byId('srcConfig').value || '{}');
+  } catch (e) {
+    showBanner('config 不是合法 JSON：' + e.message);
+    return;
+  }
+  let template = null;
+  const tplText = byId('srcTemplate').value.trim();
+  if (tplText) {
+    try {
+      template = JSON.parse(tplText);
+    } catch (e) {
+      showBanner('template 不是合法 JSON：' + e.message);
+      return;
+    }
+  }
+
+  const payload = {
+    id: isNew ? id : editId,
+    name,
+    type: byId('srcType').value,
+    domain: byId('srcDomain').value.trim() || '综合',
+    enabled: byId('srcEnabled').checked,
+    config,
+    template,
+  };
+  // 数字项留空时不提交，由服务端补默认值
+  [['limit', 'srcLimit'], ['minIntervalMinutes', 'srcInterval'], ['timeoutSeconds', 'srcTimeout']]
+    .forEach(([key, elId]) => {
+      const v = byId(elId).value;
+      const n = Number(v);
+      if (v !== '' && Number.isFinite(n) && n >= 0) payload[key] = Math.round(n);
+    });
+
+  btn.disabled = true;
+  btn.classList.add('loading');
+  try {
+    const path = isNew ? API + '/sources/config' : API + '/sources/config/' + encodeURIComponent(editId);
+    const res = await request(path, {
+      method: isNew ? 'POST' : 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then((r) => r.json());
+    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 400);
+    state.manage.editing = null;
+    hideBanner();
+    toast(isNew ? '数据源已新增：' + id : '数据源已保存：' + editId);
+    await loadManage({ force: true });
+  } catch (e) {
+    showBanner('保存数据源失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+  }
+}
+
+function onManageListClick(e) {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn || btn.disabled) return;
+  const card = btn.closest('.src-card');
+  const id = card ? card.dataset.id : '';
+  if (!id) return;
+  const act = btn.dataset.act;
+  if (act === 'test') testSource(id);
+  else if (act === 'fetchone') fetchSource(id);
+  else if (act === 'edit') openSrcEditor(id);
+  else if (act === 'delete') deleteSource(id, btn);
+  else if (act === 'close-test') {
+    const t = state.manage.test[id];
+    if (t) { t.open = false; renderManage(); }
+  } else if (act === 'toggle-raw') {
+    const t = state.manage.test[id];
+    if (t) { t.rawExpanded = !t.rawExpanded; renderManage(); }
+  }
+}
+
+/* ---------------- RSSHub 全局实例 ---------------- */
+
+/** 实例列表加载（带缓存；force=true 时重新拉取），失败不影响源列表 */
+async function loadRsshubInstances(opts = {}) {
+  const { force = false } = opts;
+  const r = state.manage.rsshub;
+  if (r.loading) return;
+  if (!force && Array.isArray(r.instances)) { renderRsshub(); return; }
+  r.loading = true;
+  renderRsshub();
+  try {
+    const d = await getJson(API + '/rsshub/instances');
+    r.instances = Array.isArray(d && d.instances) ? d.instances : [];
+    r.error = null;
+  } catch (e) {
+    // 已有旧列表时保留展示（横幅已提示），仅在无数据时行内展示错误
+    r.error = Array.isArray(r.instances) ? null : e.message;
+    showBanner('加载 RSSHub 实例列表失败：' + e.message);
+  } finally {
+    r.loading = false;
+    renderRsshub();
+  }
+}
+
+function renderRsshub() {
+  const r = state.manage.rsshub;
+  const list = Array.isArray(r.instances) ? r.instances : [];
+  const hasView = r.loading || r.error || Array.isArray(r.instances);
+  byId('rsshubPanel').hidden = !hasView;
+  if (!hasView) return;
+
+  const testAllBtn = byId('rsshubTestAll');
+  const refreshBtn = byId('rsshubRefresh');
+  testAllBtn.disabled = r.loading || r.testingAll || !list.length;
+  testAllBtn.classList.toggle('loading', r.testingAll);
+  refreshBtn.disabled = r.loading || r.testingAll;
+  refreshBtn.classList.toggle('loading', r.loading);
+
+  const tbody = byId('rsshubTbody');
+  if (r.loading && !Array.isArray(r.instances)) {
+    tbody.innerHTML = '<tr><td colspan="7"><div class="rsshub-loading">' +
+      '<span class="spinner" aria-hidden="true"></span>正在加载实例列表…</div></td></tr>';
+    return;
+  }
+  if (!list.length) {
+    tbody.innerHTML = r.error
+      ? '<tr><td colspan="7"><div class="rsshub-error">加载实例列表失败：' + esc(r.error) + '</div></td></tr>'
+      : '<tr><td colspan="7"><div class="src-empty-mini">暂无 RSSHub 实例</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(rsshubRowHtml).join('');
+}
+
+function rsshubRowHtml(inst) {
+  const r = state.manage.rsshub;
+  const url = String(inst.url || '');
+  const testing = !!r.testing[url];
+  const onlineCls = inst.online === true ? 'badge-ok' : (inst.online === false ? 'badge-err' : 'badge-idle');
+  const onlineTxt = inst.online === true ? '在线' : (inst.online === false ? '离线' : '未测');
+  const errTxt = inst.online === false ? String(inst.lastError || '') : '';
+  const dur = inst.durationMs != null ? fmtNum(inst.durationMs) + ' ms' : '—';
+  const durTip = inst.statusCode != null ? 'HTTP ' + inst.statusCode : '';
+  const href = safeUrl(url);
+
+  return '<tr>' +
+    '<td class="td-trunc td-title mono" title="' + esc(url) + '">' + (href
+      ? '<a class="link" href="' + esc(href) + '" target="_blank" rel="noopener">' + esc(url) + '</a>'
+      : esc(url || '—')) + '</td>' +
+    '<td class="td-trunc" title="' + esc(inst.name == null ? '' : inst.name) + '">' + esc(inst.name || '—') + '</td>' +
+    '<td class="td-trunc" title="' + esc(inst.location == null ? '' : inst.location) + '">' + esc(inst.location || '—') + '</td>' +
+    '<td class="td-trunc" title="' + esc(inst.maintainer == null ? '' : inst.maintainer) + '">' + esc(inst.maintainer || '—') + '</td>' +
+    '<td class="td-conn">' +
+      '<span class="badge ' + onlineCls + '">' + onlineTxt + '</span>' +
+      (errTxt ? '<div class="inst-err" title="' + esc(errTxt) + '">' + esc(errTxt) + '</div>' : '') +
+    '</td>' +
+    '<td class="td-num"' + (durTip ? ' title="' + esc(durTip) + '"' : '') + '>' + dur + '</td>' +
+    '<td class="td-conn">' +
+      '<button type="button" class="btn btn-sm' + (testing ? ' loading' : '') +
+        '" data-act="test-inst" data-url="' + esc(url) + '"' +
+        (testing || r.testingAll ? ' disabled' : '') + '>' +
+        '<span class="btn-spin" aria-hidden="true"></span><span>测试</span></button>' +
+    '</td>' +
+    '</tr>';
+}
+
+/** 测试单个实例在线状态（url 以 encodeURIComponent 完整编码，含 https:// 前缀） */
+async function testRsshubInstance(url) {
+  const r = state.manage.rsshub;
+  if (!url || r.testing[url]) return;
+  r.testing[url] = true;
+  renderRsshub();
+  try {
+    const res = await request(API + '/rsshub/test/' + encodeURIComponent(url), {
+      method: 'POST',
+    }).then((x) => x.json());
+    const inst = (Array.isArray(r.instances) ? r.instances : []).find((x) => x.url === url);
+    if (inst) {
+      inst.online = res.online === true;
+      inst.lastError = res.error || null;
+      inst.durationMs = res.durationMs == null ? null : res.durationMs;
+      inst.statusCode = res.statusCode == null ? null : res.statusCode;
+    }
+  } catch (e) {
+    showBanner('测试 RSSHub 实例失败：' + e.message);
+  } finally {
+    delete r.testing[url];
+    renderRsshub();
+  }
+}
+
+/** 全部测试：顺序遍历实例，每完成一个即更新该行状态 */
+async function testAllRsshubInstances() {
+  const r = state.manage.rsshub;
+  const list = Array.isArray(r.instances) ? r.instances.slice() : [];
+  if (!list.length || r.testingAll) return;
+  r.testingAll = true;
+  renderRsshub();
+  try {
+    for (const inst of list) {
+      await testRsshubInstance(String(inst.url || ''));
+    }
+    toast('RSSHub 实例测试完成：共 ' + list.length + ' 个');
+  } finally {
+    r.testingAll = false;
+    renderRsshub();
+  }
+}
+
+/** 实例表「测试」按钮的事件委托 */
+function onRsshubTbodyClick(e) {
+  const btn = e.target.closest('button[data-act="test-inst"]');
+  if (!btn || btn.disabled) return;
+  testRsshubInstance(btn.dataset.url);
+}
+
 /* ---------------- 控制操作（获取 / 清洗 / AI / 全流程） ---------------- */
 
 function setControlsDisabled(dis) {
@@ -827,6 +1451,25 @@ function bindEvents() {
   });
   byId('promptSave').addEventListener('click', savePrompt);
   byId('promptText').addEventListener('input', updatePromptDirty);
+
+  // 数据源管理：刷新 / 新增 / 表单保存取消 / 列表操作（事件委托）
+  byId('manageRefresh').addEventListener('click', () => loadManage({ force: true }));
+  byId('manageAdd').addEventListener('click', () => openSrcEditor(null));
+  byId('srcSave').addEventListener('click', saveSrcEditor);
+  byId('srcCancel').addEventListener('click', cancelSrcEditor);
+  byId('manageList').addEventListener('click', onManageListClick);
+  byId('manageList').addEventListener('change', onManageListChange);
+
+  // 数据源管理：领域筛选（仅重渲染卡片网格，不动其他状态）
+  byId('srcDomainFilter').addEventListener('change', (e) => {
+    state.manage.filter = e.target.value;
+    renderManage();
+  });
+
+  // RSSHub 全局实例：单行测试（委托）/ 全部测试 / 刷新列表
+  byId('rsshubTbody').addEventListener('click', onRsshubTbodyClick);
+  byId('rsshubTestAll').addEventListener('click', testAllRsshubInstances);
+  byId('rsshubRefresh').addEventListener('click', () => loadRsshubInstances({ force: true }));
 
   // 错误横幅关闭
   el.bannerClose.addEventListener('click', hideBanner);

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-gcores",
+  "name": "机核网文章",
+  "type": "rsshub",
+  "domain": "游戏",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/gcores/articles"
+  },
+  "template": null,
+  "description": "机核网游戏文章（另有 /videos 视频）"
+}

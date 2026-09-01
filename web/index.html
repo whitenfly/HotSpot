@@ -57,6 +57,7 @@
       <a class="tab" href="#sources" data-tab="sources">数据源可用性</a>
       <a class="tab" href="#config" data-tab="config">配置</a>
       <a class="tab" href="#prompts" data-tab="prompts">提示词</a>
+      <a class="tab" href="#manage" data-tab="manage">数据源管理</a>
     </div>
   </nav>
 </header>
@@ -216,6 +217,125 @@
           <span id="promptDirty" class="badge badge-warn" hidden>未保存</span>
         </div>
         <textarea id="promptText" class="code-area code-area-sm" spellcheck="false" placeholder="点击左侧文件名，加载提示词内容…"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 数据源管理 ==================== -->
+  <section id="panel-manage" class="panel">
+    <div class="panel-head">
+      <h2>数据源管理</h2>
+      <div id="srcFilterBar" class="src-filter" hidden>
+        <label class="cat-label" for="srcDomainFilter">领域</label>
+        <select id="srcDomainFilter" class="select"></select>
+        <span id="srcFilterCount" class="chip">共 0 个源</span>
+      </div>
+      <div class="panel-tools">
+        <div id="manageStats" class="stats"></div>
+        <button type="button" class="btn btn-sm" id="manageRefresh">刷新</button>
+        <button type="button" class="btn btn-sm btn-primary" id="manageAdd">新增数据源</button>
+      </div>
+    </div>
+    <p class="hint">每个数据源独立存储为服务端 <code>data/sources/{id}.json</code>，支持增删改查。「测试联通」实时抓取一次并预览原始响应与解析结果；「单独获取」抓取后并入最近一次快照，可继续执行数据清洗 / AI 整理。config 中密钥类字段已脱敏显示，原样保存即可，服务端会自动还原真实密钥。</p>
+
+    <!-- 新增 / 编辑表单（就地展开） -->
+    <div id="srcEditor" class="src-editor" hidden>
+      <div class="src-editor-head">
+        <h3 id="srcEditorTitle" class="sub-title">新增数据源</h3>
+        <div class="panel-tools">
+          <button type="button" class="btn btn-sm" id="srcCancel">取消</button>
+          <button type="button" class="btn btn-sm btn-primary" id="srcSave"><span class="btn-spin" aria-hidden="true"></span><span>保存数据源</span></button>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-k">id <em>*</em></span>
+          <input id="srcId" class="input mono" type="text" maxlength="64" placeholder="如 weibo_hot" spellcheck="false" autocapitalize="off" autocorrect="off">
+          <span class="field-hint">仅字母 / 数字 / - / _，最长 64 字符；编辑时不可修改</span>
+        </label>
+        <label class="field">
+          <span class="field-k">名称 <em>*</em></span>
+          <input id="srcName" class="input" type="text" maxlength="64" placeholder="如 微博热搜">
+        </label>
+        <label class="field">
+          <span class="field-k">类型</span>
+          <select id="srcType" class="select">
+            <option value="rss">rss · RSS/Atom 订阅</option>
+            <option value="json_get">json_get · JSON GET 接口</option>
+            <option value="json_post">json_post · JSON POST 接口</option>
+            <option value="html">html · HTML 页面解析</option>
+            <option value="rsshub">rsshub · RSSHub 路由</option>
+            <option value="wbi_json">wbi_json · Bilibili WBI 接口</option>
+            <option value="google_news">google_news · Google News</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-k">领域</span>
+          <input id="srcDomain" class="input" type="text" maxlength="32" placeholder="如 综合 / 科技 / 财经">
+        </label>
+        <div class="field">
+          <span class="field-k">启用状态</span>
+          <label class="switch src-switch">
+            <input type="checkbox" id="srcEnabled" checked>
+            <span class="switch-track"><span class="switch-knob"></span></span>
+            <span class="switch-label">启用该数据源</span>
+          </label>
+        </div>
+        <label class="field">
+          <span class="field-k">条数上限 limit</span>
+          <input id="srcLimit" class="input" type="number" min="1" step="1" placeholder="30">
+        </label>
+        <label class="field">
+          <span class="field-k">最小间隔（分钟）</span>
+          <input id="srcInterval" class="input" type="number" min="0" step="1" placeholder="10">
+        </label>
+        <label class="field">
+          <span class="field-k">超时（秒）</span>
+          <input id="srcTimeout" class="input" type="number" min="1" step="1" placeholder="15">
+        </label>
+      </div>
+      <div class="form-cols">
+        <div class="field">
+          <span class="field-k">config（JSON）</span>
+          <textarea id="srcConfig" class="code-area code-area-xs" spellcheck="false" autocapitalize="off" autocorrect="off" wrap="off" placeholder="{&quot;url&quot;: &quot;&quot;}"></textarea>
+          <span class="field-hint">类型相关参数（url / method / headers / params / body / selector 等）。密钥类字段回显已脱敏，保存时服务端自动还原</span>
+        </div>
+        <div class="field">
+          <span class="field-k">template（JSON，可空）</span>
+          <textarea id="srcTemplate" class="code-area code-area-xs" spellcheck="false" autocapitalize="off" autocorrect="off" wrap="off" placeholder="{&quot;type&quot;:&quot;json&quot;,&quot;itemsPath&quot;:&quot;data.list&quot;,&quot;fields&quot;:{&quot;title&quot;:&quot;title&quot;,&quot;url&quot;:&quot;url&quot;,&quot;heat&quot;:null,&quot;summary&quot;:null}}"></textarea>
+          <div class="tpl-help">解析模板类型：<b>json</b>＝<code>itemsPath</code> 点路径定位条目数组；<b>html</b>＝<code>selector</code> CSS 选择器定位链接条目；<b>rss</b>＝RSS/Atom 通用解析。<code>fields</code> 映射字段路径（title / url / heat / publishedAt / summary 等，null 表示不提取）。留空使用类型内置解析。</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="manageState" class="tab-state" hidden></div>
+    <div id="manageList" class="src-grid" hidden></div>
+
+    <!-- RSSHub 全局实例（独立卡片区块，位于源卡片网格下方） -->
+    <div id="rsshubPanel" class="rsshub-panel" hidden>
+      <div class="rsshub-head">
+        <h3 class="rsshub-title">RSSHub 全局实例</h3>
+        <div class="panel-tools">
+          <button type="button" class="btn btn-sm" id="rsshubTestAll"><span class="btn-spin" aria-hidden="true"></span><span>全部测试</span></button>
+          <button type="button" class="btn btn-sm" id="rsshubRefresh"><span class="btn-spin" aria-hidden="true"></span><span>刷新列表</span></button>
+        </div>
+      </div>
+      <p class="hint">公共实例列表，抓取 RSSHub 路由时优先使用 online 实例并故障转移；可测试各实例在线状态。</p>
+      <div class="table-wrap table-flat">
+        <table class="inst-table">
+          <thead>
+            <tr>
+              <th class="td-title">实例 URL</th>
+              <th>名称</th>
+              <th>Location</th>
+              <th>Maintainer</th>
+              <th class="td-conn">状态</th>
+              <th class="td-num">耗时</th>
+              <th class="td-conn">操作</th>
+            </tr>
+          </thead>
+          <tbody id="rsshubTbody"></tbody>
+        </table>
       </div>
     </div>
   </section>

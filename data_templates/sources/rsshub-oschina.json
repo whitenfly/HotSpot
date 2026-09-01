@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-oschina",
+  "name": "开源中国资讯",
+  "type": "rsshub",
+  "domain": "开源",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/oschina/news"
+  },
+  "template": null,
+  "description": "开源中国资讯，可加 /ai 等分类"
+}

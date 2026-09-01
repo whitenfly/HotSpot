@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-cnblogs",
+  "name": "博客园推荐",
+  "type": "rsshub",
+  "domain": "技术",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/cnblogs/aggsite/topdiggs"
+  },
+  "template": null,
+  "description": "博客园 10 天推荐排行榜（另有 topviews/headline/pick）"
+}

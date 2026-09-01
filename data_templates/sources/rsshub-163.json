@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-163",
+  "name": "网易新闻排行榜",
+  "type": "rsshub",
+  "domain": "综合",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/163/news/rank/whole/click/day"
+  },
+  "template": null,
+  "description": "网易新闻点击排行榜（可按分类/时间调整参数）"
+}

@@ -1,0 +1,14 @@
+{
+  "id": "rsshub-weibo",
+  "name": "微博热搜",
+  "type": "rsshub",
+  "domain": "综合",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/weibo/search/hot"
+  },
+  "template": null
+}

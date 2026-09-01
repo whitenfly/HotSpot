@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-bilibili",
+  "name": "B站全站排行榜",
+  "type": "rsshub",
+  "domain": "娱乐",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/bilibili/ranking/0"
+  },
+  "template": null,
+  "description": "哔哩哔哩全站排行榜（0=全站，可换 1/3/4/36 等分区 ID）"
+}

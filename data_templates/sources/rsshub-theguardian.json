@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-theguardian",
+  "name": "卫报中国",
+  "type": "rsshub",
+  "domain": "国际",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/theguardian/china"
+  },
+  "template": null,
+  "description": "The Guardian China 频道"
+}

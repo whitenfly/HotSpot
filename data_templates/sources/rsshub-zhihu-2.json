@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-zhihu-2",
+  "name": "知乎想法热榜",
+  "type": "rsshub",
+  "domain": "社会",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/zhihu/pin/hotlist"
+  },
+  "template": null,
+  "description": "知乎想法热榜"
+}

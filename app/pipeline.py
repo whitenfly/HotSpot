@@ -12,8 +12,8 @@ import time
 
 from . import ai_organizer, cleaner
 from .config import config_manager
-from .fetchers import fetch_all_sources
-from .models import PublishPayload, RawSnapshot, now_ms
+from .fetchers import fetch_all_sources, fetch_source
+from .models import PublishPayload, RawItem, RawSnapshot, now_ms
 from .storage import storage
 
 logger = logging.getLogger("hotspot.pipeline")
@@ -76,6 +76,158 @@ async def run_fetch(force: bool = False, reuse_window_seconds: float = 0) -> Raw
     finally:
         _run_state["running"] = False
         _run_state["finishedAt"] = now_ms()
+
+
+async def run_fetch_source(source_id: str, force: bool = True) -> RawSnapshot:
+    """单源单独获取，并与最近一次获取快照部分合并（需求：只更新该数据源数据部分）。
+
+    场景：全量获取后某源失败/需单独刷新时，手动对该源重新获取，
+    新数据替换最近快照中该源的数据，其他源数据保留，生成新的 raw 快照
+    （覆盖 latest/raw），从而后续 清洗/AI 流程基于合并后的完整数据继续。
+    """
+    _run_state["running"] = True
+    _run_state["startedAt"] = now_ms()
+    _run_state["lastError"] = None
+    try:
+        source_cfg = config_manager.get_source(source_id)
+        if source_cfg is None:
+            raise RuntimeError(f"数据源不存在: {source_id}")
+
+        _set_stage("fetch", f"单独获取数据源 {source_cfg.get('name', source_id)}…")
+        new_items, status = await fetch_source(source_cfg, force=force)
+
+        latest = storage.load_latest("raw")
+        if latest is None:
+            snapshot = RawSnapshot(items=new_items, sources=[status])
+        else:
+            base = RawSnapshot.model_validate(latest)
+            kept_items = [it for it in base.items if it.source != source_id]
+            kept_statuses = [s for s in base.sources if s.source != source_id]
+            snapshot = RawSnapshot(
+                items=kept_items + new_items,
+                sources=kept_statuses + [status],
+                extra={"partial": True, "mergedSource": source_id, "baseRunId": base.runId},
+            )
+
+        storage.save_snapshot("raw", snapshot)
+        _run_state["runs"]["raw"] = snapshot.runId
+        update_source_availability(snapshot)
+        msg = (
+            f"单源获取完成：{source_cfg.get('name', source_id)} {len(new_items)} 条，"
+            f"合并后共 {len(snapshot.items)} 条（其他源数据保留）"
+        )
+        _set_stage("fetch", msg)
+        return snapshot
+    except Exception as exc:  # noqa: BLE001
+        _run_state["lastError"] = f"{type(exc).__name__}: {exc}"
+        _set_stage("fetch", f"单源获取失败：{exc}")
+        raise
+    finally:
+        _run_state["running"] = False
+        _run_state["finishedAt"] = now_ms()
+
+
+def update_source_availability(snapshot: RawSnapshot, status: SourceStatus | None = None) -> dict:
+    """更新独立源可用性快照（latest/availability.json）。
+
+    单源测试 / 单源获取后调用：以最近一次可用性快照为基础（无则用最近 raw/ai 快照），
+    更新/合并指定源的状态后写回，使「数据源可用性」列表始终反映最新单源操作结果。
+    """
+    from .models import SourceStatus as _Status
+
+    # 基准：availability 优先，回退 raw，再回退 ai
+    availability = storage.load_latest("availability")
+    base_sources: list[dict] = []
+    base_fetched = 0
+    if availability and availability.get("sources"):
+        base_sources = availability["sources"]
+        base_fetched = availability.get("updatedAt", 0)
+    else:
+        for kind in ("raw", "ai"):
+            snap = storage.load_latest(kind)
+            if snap and snap.get("sources"):
+                base_sources = snap["sources"]
+                base_fetched = snap.get("fetchedAt") or snap.get("generatedAt") or 0
+                break
+
+    merged = {s["source"]: dict(s) for s in base_sources if isinstance(s, dict) and s.get("source")}
+    if status is not None:
+        merged[status.source] = status.model_dump()
+    elif snapshot is not None:
+        for s in snapshot.sources:
+            merged[s.source] = s.model_dump()
+
+    now = now_ms()
+    payload = {
+        "type": "availability",
+        "updatedAt": now,
+        "sources": list(merged.values()),
+    }
+    storage.save_raw_extra("availability", payload)
+    return payload
+
+
+def exclude_source(source_id: str) -> dict | None:
+    """禁用数据源：从最新原始快照中剔除该源数据并备份，使其不再进入后续清洗/AI。
+
+    备份内容含该源全部条目与获取时间（fetchedAt），存于 data/disabled/{source_id}/，
+    供重新启用时恢复（需求：保留备份，看数据获取时间决定是否复用）。
+    """
+    latest = storage.load_latest("raw")
+    if not latest:
+        return None
+    base = RawSnapshot.model_validate(latest)
+    removed_items = [it for it in base.items if it.source == source_id]
+    if removed_items:
+        fetched_at = max(it.fetchedAt for it in removed_items)
+        storage.save_disabled_source(source_id, {
+            "sourceId": source_id,
+            "sourceName": removed_items[0].sourceName,
+            "fetchedAt": fetched_at,
+            "backedUpAt": now_ms(),
+            "items": [it.model_dump() for it in removed_items],
+        })
+    kept_items = [it for it in base.items if it.source != source_id]
+    kept_statuses = [s for s in base.sources if s.source != source_id]
+    extra = dict(base.extra)
+    extra["excludedSource"] = source_id
+    snapshot = RawSnapshot(items=kept_items, sources=kept_statuses, extra=extra)
+    storage.save_snapshot("raw", snapshot)
+    update_source_availability(snapshot)
+    return snapshot.model_dump()
+
+
+def restore_source(source_id: str) -> dict | None:
+    """重新启用数据源：从备份恢复该源数据并合并回最新原始快照。
+
+    仅当备份数据的获取时间不早于当前快照中该源数据时复用（需求：看数据获取时间）；
+    无备份时返回 None（等待下一次正常抓取）。
+    """
+    backup = storage.load_disabled_source(source_id)
+    if not backup or not backup.get("items"):
+        return None
+    backup_items = [RawItem.model_validate(it) for it in backup["items"]]
+    backup_fetched = backup.get("fetchedAt") or max(it.fetchedAt for it in backup_items)
+
+    latest = storage.load_latest("raw")
+    if not latest:
+        snapshot = RawSnapshot(items=backup_items)
+    else:
+        base = RawSnapshot.model_validate(latest)
+        existing = [it for it in base.items if it.source == source_id]
+        existing_fetched = max(it.fetchedAt for it in existing) if existing else 0
+        if existing and existing_fetched >= backup_fetched:
+            return base.model_dump()  # 现有数据更新，不覆盖
+        kept_items = [it for it in base.items if it.source != source_id]
+        kept_statuses = [s for s in base.sources if s.source != source_id]
+        snapshot = RawSnapshot(
+            items=kept_items + backup_items,
+            sources=kept_statuses,
+            extra=dict(base.extra),
+        )
+    storage.save_snapshot("raw", snapshot)
+    update_source_availability(snapshot)
+    return snapshot.model_dump()
 
 
 async def run_clean() -> dict:

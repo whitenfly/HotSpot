@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-github",
+  "name": "GitHub Trending",
+  "type": "rsshub",
+  "domain": "开源",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/github/trending/daily/any"
+  },
+  "template": null,
+  "description": "GitHub 每日趋势仓库（any=全部语言，可换 javascript 等；需实例配置 GITHUB_ACCESS_TOKEN）"
+}

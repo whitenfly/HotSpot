@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY web/ ./web/
 COPY prompts/ ./prompts/
+COPY data_templates/ ./data_templates/
 
 # 运行数据目录（可挂载卷持久化）
 RUN mkdir -p /app/data

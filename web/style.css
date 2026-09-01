@@ -1013,3 +1013,394 @@ a.rank-title:hover { color: var(--accent); }
   /* 加载指示器保留动画（功能性反馈） */
   .spinner, .btn-spin { animation-duration: 0.8s !important; }
 }
+
+/* ---------------- 19. 数据源管理 ---------------- */
+
+/* 源卡片网格：默认 1 列，≥640px 2 列，≥1100px 3 列 */
+.src-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--sp-4);
+  align-items: start;
+}
+
+@media (min-width: 640px) {
+  .src-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (min-width: 1100px) {
+  .src-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ---- 源卡片 ---- */
+.src-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-lg);
+  transition: border-color 0.15s ease;
+}
+.src-card:hover { border-color: var(--border); }
+
+/* 测试面板展开时占满整行，保证预览表格可读 */
+.src-card.expanded { grid-column: 1 / -1; }
+
+.src-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.src-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.src-name {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.src-type {
+  font-family: var(--font-mono);
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: var(--accent-bd);
+}
+
+.src-card-sub {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  word-break: break-all;
+  margin-top: calc(var(--sp-1) - var(--sp-3));
+}
+
+.src-card-meta {
+  display: flex;
+  gap: 4px var(--sp-4);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+
+.src-meta-v {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.src-card-actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.btn-danger { color: var(--err); }
+.btn-danger:hover:not(:disabled) {
+  background: var(--err-bg);
+  border-color: var(--err-bd);
+  color: var(--err);
+}
+
+/* ---- 单独获取结果条 ---- */
+.src-fetch-res {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding: 8px var(--sp-3);
+  border: 1px solid var(--ok-bd);
+  border-radius: var(--r);
+  background: var(--ok-bg);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.src-fetch-res.is-loading {
+  border-color: var(--border-soft);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.src-fetch-res.is-err {
+  border-color: var(--err-bd);
+  background: var(--err-bg);
+}
+
+.src-fetch-text { word-break: break-all; min-width: 0; }
+
+/* ---- 测试联通结果面板 ---- */
+.src-test {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+
+.src-test-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-base);
+}
+
+.src-test-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.src-test-meta {
+  display: inline-flex;
+  gap: var(--sp-2) var(--sp-4);
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+
+.src-test-close { margin-left: auto; }
+
+.src-test-error {
+  padding: 8px var(--sp-3);
+  border: 1px solid var(--err-bd);
+  border-radius: var(--r);
+  background: var(--err-bg);
+  color: var(--err);
+  font-size: var(--fs-sm);
+  word-break: break-all;
+}
+
+.src-sec { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+
+.src-sec-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.src-sec-title { font-size: var(--fs-sm); font-weight: 600; color: var(--muted); }
+
+.src-sec-head .btn { margin-left: auto; }
+
+.src-pre {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--inset);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.src-items-wrap { max-height: 420px; border-color: var(--border-soft); }
+
+.src-empty-mini {
+  padding: var(--sp-3);
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--r);
+  color: var(--faint);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+.td-extra { max-width: 200px; }
+
+/* ---- 新增 / 编辑表单 ---- */
+.src-editor {
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--accent-bd);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+}
+
+.src-editor-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+
+.src-editor-head .sub-title { margin: 0; }
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--sp-3) var(--sp-4);
+}
+
+.form-cols {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--sp-3) var(--sp-4);
+  margin-top: var(--sp-4);
+}
+
+@media (min-width: 920px) {
+  .form-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.field-k { font-size: var(--fs-sm); font-weight: 600; color: var(--muted); }
+.field-k em { font-style: normal; color: var(--err); }
+
+.field-hint {
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  line-height: 1.5;
+}
+
+.field .select { width: 100%; min-width: 0; }
+
+.src-switch { padding: 7px 0; }
+
+.input {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  color: var(--text);
+  font-size: var(--fs-base);
+  font-family: inherit;
+}
+.input:focus { outline: none; border-color: var(--accent-bd); box-shadow: var(--ring); }
+.input:read-only {
+  color: var(--muted);
+  background: var(--surface-2);
+  cursor: default;
+}
+
+.code-area-xs { min-height: 180px; }
+
+.tpl-help {
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  line-height: 1.7;
+  word-break: break-all;
+}
+.tpl-help b { color: var(--muted); }
+.tpl-help code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  color: var(--text);
+}
+
+/* ---- 领域筛选（数据源管理头部） ---- */
+.src-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* ---- 源卡片启停开关 / 禁用态 ---- */
+.src-toggle { flex: none; }
+
+.src-toggle:has(input:disabled) { cursor: wait; }
+.src-toggle:has(input:disabled) .switch-track { opacity: 0.5; }
+.src-toggle.switching .switch-label { color: var(--faint); }
+
+/* 被禁用的源卡片整体弱化，保持可读 */
+.src-card.is-disabled { opacity: 0.65; }
+
+/* 源卡片 meta 区描述（如 RSSHub 路由源的 description 字段） */
+.src-meta-desc {
+  flex-basis: 100%;
+  color: var(--muted);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+/* ---- RSSHub 全局实例面板 ---- */
+.rsshub-panel {
+  margin-top: var(--sp-6);
+  padding: var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+}
+
+.rsshub-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-2);
+}
+
+.rsshub-title { font-size: var(--fs-md); font-weight: 600; white-space: nowrap; }
+
+.rsshub-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) 0;
+  color: var(--muted);
+  font-size: var(--fs-base);
+}
+
+.rsshub-error {
+  margin: var(--sp-2) 0;
+  padding: 8px var(--sp-3);
+  border: 1px solid var(--err-bd);
+  border-radius: var(--r);
+  background: var(--err-bg);
+  color: var(--err);
+  font-size: var(--fs-sm);
+  word-break: break-all;
+}
+
+/* 实例行错误信息（离线时展示，截断 + title 全文） */
+.inst-err {
+  margin: 4px auto 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--err);
+  font-size: var(--fs-xs);
+  text-align: left;
+}

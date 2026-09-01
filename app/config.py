@@ -197,12 +197,12 @@ class ConfigManager:
 
     @staticmethod
     def _defaults() -> dict[str, Any]:
+        # sources 已迁移为独立单文件（data/sources/*.json），不再内嵌于 config.json
         return {
             "version": 1,
             "scheduler": deepcopy(DEFAULT_SCHEDULER_CONFIG),
             "ai": deepcopy(DEFAULT_AI_CONFIG),
             "cleaning": deepcopy(DEFAULT_CLEANING_CONFIG),
-            "sources": deepcopy(DEFAULT_SOURCES),
         }
 
     @staticmethod
@@ -228,17 +228,15 @@ class ConfigManager:
             return deepcopy(self._config)
 
     def get_sources(self, enabled_only: bool = False) -> list[dict[str, Any]]:
-        with self._lock:
-            sources = deepcopy(self._config.get("sources", []))
-        if enabled_only:
-            sources = [s for s in sources if s.get("enabled", True)]
+        from .sources_manager import sources_manager
+
+        sources = sources_manager.list_sources(enabled_only=enabled_only)
         return sources
 
     def get_source(self, source_id: str) -> dict[str, Any] | None:
-        for s in self.get_sources():
-            if s["id"] == source_id:
-                return s
-        return None
+        from .sources_manager import sources_manager
+
+        return sources_manager.get_source(source_id)
 
     def get_scheduler(self) -> dict[str, Any]:
         with self._lock:

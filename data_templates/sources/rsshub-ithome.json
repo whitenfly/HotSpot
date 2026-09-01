@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-ithome",
+  "name": "IT之家资讯",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/ithome/it"
+  },
+  "template": null,
+  "description": "IT之家科技资讯（可换 /news、/digi 等栏目）"
+}

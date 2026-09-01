@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-cls",
+  "name": "财联社热门文章",
+  "type": "rsshub",
+  "domain": "财经",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/cls/hot"
+  },
+  "template": null,
+  "description": "财联社热门文章排行榜"
+}

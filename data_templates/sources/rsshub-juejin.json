@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-juejin",
+  "name": "掘金 AI 编程",
+  "type": "rsshub",
+  "domain": "AI",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/juejin/aicoding"
+  },
+  "template": null,
+  "description": "掘金 AI 编程榜单（可加 /trending 等排序）"
+}

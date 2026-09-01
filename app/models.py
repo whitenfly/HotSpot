@@ -72,6 +72,7 @@ class RawSnapshot(BaseModel):
     fetchedAt: int = Field(default_factory=now_ms)
     items: list[RawItem] = Field(default_factory=list)
     sources: list[SourceStatus] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict, description="附加元信息（如部分更新标记）")
 
 
 # ============ 清洗后数据（需求三） ============

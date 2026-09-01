@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-nytimes",
+  "name": "纽约时报首页",
+  "type": "rsshub",
+  "domain": "国际",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/nytimes/rss/HomePage"
+  },
+  "template": null,
+  "description": "纽约时报 RSS 首页，可换 World/Technology 等栏目"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-bilibili-2",
+  "name": "B站热搜",
+  "type": "rsshub",
+  "domain": "娱乐",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/bilibili/hot-search"
+  },
+  "template": null,
+  "description": "B站热搜榜"
+}

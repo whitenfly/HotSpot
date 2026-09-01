@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-zhihu",
+  "name": "知乎热榜",
+  "type": "rsshub",
+  "domain": "综合",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/zhihu/hot"
+  },
+  "template": null,
+  "description": "知乎全站热榜，可加 /total、/science 等分类"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-nature",
+  "name": "Nature 新闻",
+  "type": "rsshub",
+  "domain": "科学",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/nature/news"
+  },
+  "template": null,
+  "description": "Nature 新闻（另有 /research、/cover 等）"
+}

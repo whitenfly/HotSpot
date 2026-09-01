@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-bilibili-3",
+  "name": "B站综合热门",
+  "type": "rsshub",
+  "domain": "娱乐",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/bilibili/popular/all"
+  },
+  "template": null,
+  "description": "B站综合热门视频"
+}

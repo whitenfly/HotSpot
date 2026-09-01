@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import config_manager
+from .models import now_ms
 from .pipeline import pipeline_run_all, run_ai, run_clean, run_fetch, run_state, scheduler_loop
 from .storage import storage
 
@@ -99,7 +100,14 @@ async def get_publish():
 
 @app.get("/api/hotspot/sources")
 async def get_sources():
-    """数据源可用性（需求二）。"""
+    """数据源可用性（需求二）。
+
+    优先返回独立可用性快照（latest/availability.json，由单源测试/获取实时更新），
+    无则回退到最近 ai/raw 快照中的 sources。
+    """
+    availability = storage.load_latest("availability")
+    if availability and availability.get("sources"):
+        return JSONResponse({"updatedAt": availability.get("updatedAt", 0), "sources": availability["sources"]})
     latest = storage.load_latest("ai") or storage.load_latest("raw")
     sources = (latest or {}).get("sources", [])
     if not sources:
@@ -220,6 +228,207 @@ async def put_prompt(name: str, request: Request):
         return {"ok": True}
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+# ============ 数据源管理 API（单文件配置 / 测试 / 单独获取） ============
+
+from .sources_manager import SourceManagerError, sources_manager
+
+
+@app.get("/api/hotspot/sources/config")
+async def list_source_configs():
+    """数据源配置列表（含解析模板；config 中敏感字段脱敏）。"""
+    sources = sources_manager.list_sources()
+    return {"sources": [sources_manager.mask_api_keys(s) for s in sources]}
+
+
+@app.get("/api/hotspot/sources/config/{source_id}")
+async def get_source_config(source_id: str):
+    source = sources_manager.get_source(source_id)
+    if source is None:
+        raise HTTPException(404, "数据源不存在")
+    return sources_manager.mask_api_keys(source)
+
+
+@app.post("/api/hotspot/sources/config")
+async def create_source_config(payload: dict = Body(...)):
+    """新增数据源（单文件配置）。"""
+    try:
+        source = sources_manager.save_source(payload)
+        return {"ok": True, "source": sources_manager.mask_api_keys(source)}
+    except SourceManagerError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.put("/api/hotspot/sources/config/{source_id}")
+async def update_source_config(source_id: str, payload: dict = Body(...)):
+    """更新数据源配置。"""
+    try:
+        existing = sources_manager.get_source(source_id)
+        if existing is None:
+            raise HTTPException(404, "数据源不存在")
+        # 保留 id 一致；config 中 token/密钥脱敏值回写时沿用原值
+        payload = _restore_source_secrets(existing, payload)
+        source = sources_manager.save_source(payload)
+        return {"ok": True, "source": sources_manager.mask_api_keys(source)}
+    except SourceManagerError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.delete("/api/hotspot/sources/config/{source_id}")
+async def delete_source_config(source_id: str):
+    if sources_manager.delete_source(source_id):
+        return {"ok": True}
+    raise HTTPException(404, "数据源不存在")
+
+
+@app.post("/api/hotspot/sources/config/{source_id}/toggle")
+async def toggle_source_config(source_id: str):
+    """即时启用/禁用数据源（需求3：卡片上的开关，不进编辑表单）。
+
+    禁用：从最新原始快照剔除该源数据（不进入后续清洗/AI）并备份该源数据；
+    启用：从备份恢复该源数据（若备份获取时间不早于现有数据则复用）。
+    """
+    from .pipeline import exclude_source, restore_source
+
+    source = sources_manager.get_source(source_id)
+    if source is None:
+        raise HTTPException(404, "数据源不存在")
+    was_enabled = source.get("enabled", True)
+    new_enabled = not was_enabled
+    source["enabled"] = new_enabled
+    updated = sources_manager.save_source(source)
+
+    result: dict = {"ok": True, "enabled": updated.get("enabled", True),
+                    "source": sources_manager.mask_api_keys(updated)}
+    try:
+        if new_enabled and not was_enabled:
+            restored = restore_source(source_id)
+            result["restored"] = True if restored else False
+            result["restoredFromBackup"] = restored is not None
+        elif was_enabled and not new_enabled:
+            excluded = exclude_source(source_id)
+            result["excluded"] = True if excluded else False
+            result["backedUp"] = bool(
+                storage.load_disabled_source(source_id) if excluded else False
+            )
+    except Exception as exc:  # noqa: BLE001 - 数据剔除/恢复失败不阻断启停
+        result["dataError"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+@app.post("/api/hotspot/sources/test/{source_id}")
+async def test_source_endpoint(source_id: str):
+    """手动测试数据源联通与数据接收（返回结构化预览供页面可视化）。
+
+    测试完成后同步更新数据源可用性列表（需求：单独测试后也要更新源可用性）。
+    """
+    from .fetchers import test_source
+
+    source = sources_manager.get_source(source_id)
+    if source is None:
+        raise HTTPException(404, "数据源不存在")
+    result = await test_source(source)
+    # 将测试结果写入可用性快照
+    from .models import SourceStatus as _Status
+
+    status = _Status(
+        source=source_id,
+        sourceName=source.get("name", source_id),
+        connected=result.get("connected", False),
+        itemCount=len(result.get("itemsPreview", [])),
+        fetchedAt=now_ms(),
+        durationMs=result.get("durationMs", 0),
+        skipped=False,
+        error=result.get("error"),
+    )
+    from .pipeline import update_source_availability
+
+    update_source_availability(None, status=status)
+    return result
+
+
+@app.post("/api/hotspot/sources/fetch/{source_id}")
+async def fetch_source_endpoint(source_id: str, force: bool = Body(default=True, embed=True)):
+    """单源单独获取，并与最近一次快照部分合并（只更新该源数据部分）。"""
+    from .pipeline import run_fetch_source
+
+    try:
+        snapshot = await run_fetch_source(source_id, force=force)
+        return {
+            "ok": True,
+            "runId": snapshot.runId,
+            "items": len(snapshot.items),
+            "mergedSource": source_id,
+            "partial": snapshot.extra.get("partial", False),
+        }
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+def _restore_source_secrets(existing: dict, incoming: dict) -> dict:
+    """更新数据源配置时保护密钥类字段：incoming 为脱敏掩码值则沿用原值。"""
+    if not isinstance(incoming, dict):
+        return incoming
+    incoming_cfg = incoming.get("config")
+    existing_cfg = existing.get("config") or {}
+    if isinstance(incoming_cfg, dict) and isinstance(existing_cfg, dict):
+        for key, new_value in list(incoming_cfg.items()):
+            if isinstance(new_value, str) and ("…" in new_value or new_value == "***"):
+                if key in existing_cfg:
+                    incoming_cfg[key] = existing_cfg[key]
+    return incoming
+
+
+# ============ RSSHub 全局实例管理 API（需求2） ============
+
+from .rsshub_manager import rsshub_instances
+
+
+@app.get("/api/hotspot/rsshub/instances")
+async def list_rsshub_instances():
+    return {"instances": rsshub_instances.list_instances()}
+
+
+@app.put("/api/hotspot/rsshub/instances")
+async def update_rsshub_instances(payload: dict = Body(...)):
+    """整体更新实例列表（Web 页面编辑导入官方实例清单）。"""
+    instances = payload.get("instances", [])
+    if not isinstance(instances, list):
+        return JSONResponse({"ok": False, "error": "instances 必须是数组"}, status_code=400)
+    updated = rsshub_instances.update_instances(instances)
+    return {"ok": True, "instances": updated}
+
+
+@app.post("/api/hotspot/rsshub/test/{url:path}")
+async def test_rsshub_instance(url: str):
+    """测试单个 RSSHub 实例的 online 状态（探测根路径连通性）。"""
+    import httpx as _httpx
+
+    base = url.rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    result = {"url": base, "online": False, "error": None, "durationMs": 0}
+    import time as _time
+
+    started = _time.time()
+    try:
+        async with _httpx.AsyncClient(
+            follow_redirects=True, timeout=15.0,
+            headers={"User-Agent": "Mozilla/5.0 HotSpot/1.0"},
+        ) as client:
+            resp = await client.get(base)
+        ok = resp.status_code < 500  # 2xx/3xx/4xx 均可视为在线（4xx 说明服务器在响应）
+        result["online"] = ok
+        result["statusCode"] = resp.status_code
+        if not ok:
+            result["error"] = f"HTTP {resp.status_code}"
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        result["durationMs"] = int((_time.time() - started) * 1000)
+    rsshub_instances.set_online(base, result["online"], result["error"])
+    return result
 
 
 # ============ 历史快照 API ============

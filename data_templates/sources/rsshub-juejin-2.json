@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-juejin-2",
+  "name": "掘金前端",
+  "type": "rsshub",
+  "domain": "技术",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/juejin/category/frontend"
+  },
+  "template": null,
+  "description": "掘金前端分类文章（可换 backend/android 等）"
+}

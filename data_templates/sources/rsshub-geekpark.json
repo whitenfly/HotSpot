@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-geekpark",
+  "name": "极客公园",
+  "type": "rsshub",
+  "domain": "科技",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/geekpark"
+  },
+  "template": null,
+  "description": "极客公园栏目文章"
+}

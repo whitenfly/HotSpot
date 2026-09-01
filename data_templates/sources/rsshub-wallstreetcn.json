@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-wallstreetcn",
+  "name": "华尔街见闻最热",
+  "type": "rsshub",
+  "domain": "财经",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/wallstreetcn/hot"
+  },
+  "template": null,
+  "description": "华尔街见闻最热文章（可加 /daily、/weekly 周期）"
+}

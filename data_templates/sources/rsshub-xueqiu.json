@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-xueqiu",
+  "name": "雪球热帖",
+  "type": "rsshub",
+  "domain": "财经",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/xueqiu/hots"
+  },
+  "template": null,
+  "description": "雪球热帖榜"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-nga",
+  "name": "NGA 综合讨论",
+  "type": "rsshub",
+  "domain": "游戏",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/nga/forum/489"
+  },
+  "template": null,
+  "description": "NGA 分区帖子（489=综合讨论，可换其他 fid）"
+}

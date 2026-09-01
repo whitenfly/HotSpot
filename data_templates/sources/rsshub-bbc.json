@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-bbc",
+  "name": "BBC 亚洲新闻",
+  "type": "rsshub",
+  "domain": "国际",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/bbc/world-asia"
+  },
+  "template": null,
+  "description": "BBC News 世界/亚洲频道（可换 /bbc/news 等）"
+}

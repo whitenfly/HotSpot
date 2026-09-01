@@ -1,0 +1,15 @@
+{
+  "id": "rsshub-xueqiu-2",
+  "name": "雪球今日话题",
+  "type": "rsshub",
+  "domain": "财经",
+  "enabled": false,
+  "limit": 30,
+  "minIntervalMinutes": 30,
+  "timeoutSeconds": 25,
+  "config": {
+    "path": "/xueqiu/today"
+  },
+  "template": null,
+  "description": "雪球今日话题"
+}

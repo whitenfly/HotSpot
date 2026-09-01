@@ -17,6 +17,8 @@ from typing import Any
 from .config import DATA_DIR, config_manager
 
 RETENTION_PER_KIND = int(os.environ.get("HOTSPOT_RETENTION", "50"))
+# 禁用源数据备份保留份数（按备份时间，保留最近 N 份）
+DISABLED_RETENTION = int(os.environ.get("HOTSPOT_DISABLED_RETENTION", "5"))
 
 
 class Storage:
@@ -134,6 +136,46 @@ class Storage:
         if fetched_at and (time.time() * 1000 - fetched_at) > max_age_seconds * 1000:
             return None
         return data
+
+    # ---------- 禁用源数据备份（需求：禁用后保留数据备份，可恢复） ----------
+
+    def _disabled_dir(self, source_id: str) -> str:
+        return os.path.join(self.data_dir, "disabled", source_id)
+
+    def save_disabled_source(self, source_id: str, payload: dict[str, Any]) -> None:
+        """按时间戳备份被禁用源的数据（含获取时间），保留最近 DISABLED_RETENTION 份。"""
+        dir_path = self._disabled_dir(source_id)
+        os.makedirs(dir_path, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        self._write(os.path.join(dir_path, f"{ts}.json"), payload)
+        try:
+            files = sorted(
+                f for f in os.listdir(dir_path)
+                if f.endswith(".json") and not f.endswith(".tmp")
+            )
+        except OSError:
+            return
+        for old in files[:-DISABLED_RETENTION]:
+            try:
+                os.remove(os.path.join(dir_path, old))
+            except OSError:
+                pass
+
+    def load_disabled_source(self, source_id: str) -> dict[str, Any] | None:
+        """返回该源最近一次备份（按备份时间倒序取最新）。"""
+        dir_path = self._disabled_dir(source_id)
+        if not os.path.isdir(dir_path):
+            return None
+        try:
+            files = sorted(
+                f for f in os.listdir(dir_path)
+                if f.endswith(".json") and not f.endswith(".tmp")
+            )
+        except OSError:
+            return None
+        if not files:
+            return None
+        return self._read(os.path.join(dir_path, files[-1]))
 
 
 storage = Storage()
