@@ -22,14 +22,15 @@ docker compose up -d --build
 
 ## 对外 API（供 Firefly 消费）
 
-| 接口 | 说明 |
-| --- | --- |
+
+| 接口                       | 说明                                     |
+| -------------------------- | ---------------------------------------- |
 | `GET /api/hotspot/publish` | 对外发布载荷（Firefly 热点榜单模块消费） |
-| `GET /api/hotspot/ai` | 最新 AI 整理数据（含总榜 + 各领域榜单） |
-| `GET /api/hotspot/sources` | 数据源可用性 |
-| `GET /api/hotspot/raw` | 最新原始数据 |
-| `GET /api/hotspot/cleaned` | 最新清洗后数据 |
-| `GET /api/hotspot/health` | 健康检查 |
+| `GET /api/hotspot/ai`      | 最新 AI 整理数据（含总榜 + 各领域榜单）  |
+| `GET /api/hotspot/sources` | 数据源可用性                             |
+| `GET /api/hotspot/raw`     | 最新原始数据                             |
+| `GET /api/hotspot/cleaned` | 最新清洗后数据                           |
+| `GET /api/hotspot/health`  | 健康检查                                 |
 
 控制接口（Web 页面调试用）：
 `POST /api/hotspot/fetch`（获取数据）、`POST /api/hotspot/clean`（清洗）、
@@ -39,9 +40,11 @@ docker compose up -d --build
 ## Firefly 接入
 
 在 Firefly 中设置环境变量或修改 `src/config/siteConfig.ts`：
+
 ```ts
 trending: { apiBaseUrl: "http://<hotspot-host>:3456" }
 ```
+
 HotSpot 已开启 CORS，Firefly 前端可直接跨域请求。
 
 ## 目录结构
@@ -67,3 +70,13 @@ HotSpot/
 - `statuses/` 数据源可用性快照
 - `config.json` 运行配置
 - 每次获取后自动保存原始与清洗数据；AI 整理后自动发布到 API
+
+## 许可协议
+
+本项目遵循 [MIT license](https://mit-license.org/) 开源协议，详细查看 [LICENSE](https://github.com/whitenfly/HotSpot/blob/main/LICENSE) 文件
+
+**版权声明：**
+
+* Copyright (c) 2026 [whitenfly](https://github.com/whitenfly) - [HotSpot](https://github.com/whitenfly/HotSpot)
+
+根据 MIT 开源协议，你可以自由使用、修改、分发代码，但需保留上述版权声明。
