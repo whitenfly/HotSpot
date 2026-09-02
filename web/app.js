@@ -8,20 +8,52 @@
 /* ---------------- 常量 ---------------- */
 const API = '/api/hotspot';
 const POLL_INTERVAL = 10000;                       // 自动刷新周期：10s
+const TASK_POLL_FAST = 2000;                       // 有任务进行中时的任务轮询周期
+const TASK_POLL_SLOW = 8000;                       // 空闲时的任务轮询周期（常驻，可捕捉其他客户端提交的任务）
+const TASK_LIST_LIMIT = 20;                        // 任务面板展示条数（服务端保留最近 50 条）
 
-const TABS = ['raw', 'cleaned', 'ai', 'sources', 'config', 'prompts', 'manage'];
-const DATA_TABS = ['raw', 'cleaned', 'ai', 'sources'];   // 参与自动刷新的数据标签
+/* 流水线任务类型（互相冲突：任一运行时其余提交返回 409） */
+const PIPELINE_KINDS = ['fetch_all', 'clean', 'ai', 'run_all'];
+
+/* 任务类型 → 完成后需标记脏的数据标签 */
+const TASK_REFRESH = {
+  fetch_all: ['raw', 'sources'],
+  clean: ['cleaned'],
+  ai: ['ai', 'sources', 'ai-runs'],
+  run_all: ['raw', 'cleaned', 'ai', 'sources', 'ai-runs'],
+  fetch_source: ['raw', 'sources'],
+  ai_batch: ['ai-runs', 'ai'],      // 单批重试完成：刷新 run 详情与 AI 结果
+  ai_finalize: ['ai-runs', 'ai', 'sources'],  // 续跑终稿完成：刷新 run 详情、AI 结果与源可用性
+};
+
+const TASK_KIND_LABEL = {
+  fetch_all: '获取', clean: '清洗', ai: 'AI 整理', run_all: '全流程', fetch_source: '单源获取',
+  ai_batch: '批次重试', ai_finalize: '续跑终稿',
+};
+
+/* 任务状态 → 面板徽章样式与文案 */
+const TASK_STATE_META = {
+  pending: { badge: 'badge-idle', text: '排队' },
+  running: { badge: 'badge-run', text: '运行中' },
+  done: { badge: 'badge-ok', text: '完成' },
+  failed: { badge: 'badge-err', text: '失败' },
+  cancelled: { badge: 'badge-idle', text: '已取消' },
+};
+
+const TABS = ['raw', 'cleaned', 'ai', 'ai-runs', 'sources', 'config', 'prompts', 'manage'];
+const DATA_TABS = ['raw', 'cleaned', 'ai', 'ai-runs', 'sources'];   // 参与自动刷新的数据标签
 const TAB_LABEL = {
   raw: '原始数据',
   cleaned: '清洗后数据',
   ai: 'AI 整理结果',
+  'ai-runs': 'AI 整理记录',
   sources: '数据源可用性',
   config: '配置',
   prompts: '提示词',
   manage: '数据源',
 };
 // 各标签「内容容器」的后缀（用于空态时隐藏内容）
-const STATE_SUFFIX = { raw: 'TableWrap', cleaned: 'TableWrap', ai: 'Content', sources: 'TableWrap', manage: 'List' };
+const STATE_SUFFIX = { raw: 'TableWrap', cleaned: 'TableWrap', ai: 'Content', 'ai-runs': 'List', sources: 'TableWrap', manage: 'List' };
 
 /* ---------------- DOM 快捷方式 ---------------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -119,14 +151,17 @@ async function request(path, options = {}) {
   }
   if (!res.ok) {
     let msg = '';
+    let parsed = null;
     try {
       const text = await res.text();
       try {
-        const j = JSON.parse(text);
-        msg = j.error || j.detail || text;
+        parsed = JSON.parse(text);
+        msg = parsed.error || parsed.detail || text;
       } catch (_){ msg = text; }
     } catch (_) { /* 读取失败则仅展示状态码 */ }
-    throw new ApiError('HTTP ' + res.status + (msg ? '：' + String(msg).slice(0, 300) : ''), res.status, msg);
+    const err = new ApiError('HTTP ' + res.status + (msg ? '：' + String(msg).slice(0, 300) : ''), res.status, msg);
+    err.json = parsed;                             // 保留解析后的响应体（如 409 的 conflictTaskId）
+    throw err;
   }
   return res;
 }
@@ -138,7 +173,6 @@ const getText = (p) => request(p).then((r) => r.text());
 const state = {
   tab: 'raw',
   autoRefresh: true,
-  busy: false,                 // 控制类操作（fetch/clean/ai/run-all）进行中
   status: null,
   data: {},                    // tab -> 最近一次接口返回
   dirty: {},                   // tab -> 需要强制重新拉取
@@ -147,12 +181,19 @@ const state = {
     cleaned: { key: null, dir: 1 },
   },
   aiCategory: '',
+  aiRuns: {
+    loading: false,       // 列表请求进行中
+    detail: {},           // runId -> { loading, data, error }
+    fold: {},             // 折叠状态 key -> true(展开)/false(收起)；缺省用各处默认值
+    itemsAll: {},         // 「展开全部输入条目」key -> true
+    sig: '',              // 最近渲染签名（数据无变化不重渲染）
+  },
   prompt: { file: null, apiName: null, original: '', dirty: false },
   manage: {
     editing: null,          // null=表单关闭；'new'=新增；其他=编辑中的源 id
     editorOriginal: '',     // 表单打开时的字段快照（取消时检测未保存修改）
     test: {},               // 源 id -> { loading, open, data, error, rawExpanded }
-    fetch: {},              // 源 id -> { loading, data, error, sourceCount }
+    fetch: {},              // 源 id -> { taskId, state, progress, stage, message, error, sourceCount, detail }
     filter: '',             // 领域筛选（'' = 全部）
     toggle: {},             // 源 id -> { loading }（启停切换请求进行中）
     rsshub: {
@@ -162,6 +203,18 @@ const state = {
       testing: {},          // 实例 url -> true（该实例测试进行中）
       testingAll: false,    // 「全部测试」顺序执行中
     },
+  },
+  tasks: {
+    list: [],               // 最近拉取的任务列表（服务端最新在前）
+    running: null,          // 正在运行的流水线任务对象（无则 null）
+    seen: {},               // taskId -> 上次观察到的 state（检测状态转换）
+    hidden: {},             // taskId -> true（本地清除，不再展示）
+    srcMap: {},             // taskId -> sourceId（本页提交的单源获取任务）
+    panelOpen: false,
+    highlight: null,        // 409 冲突时定位高亮的 taskId
+    timer: null,            // 轮询定时器
+    pollP: null,            // 进行中的轮询请求（去重复用）
+    manageSig: '',          // manage 页单源任务渲染签名（无变化不重渲染）
   },
 };
 TABS.forEach((t) => { state.data[t] = null; state.dirty[t] = true; });
@@ -184,10 +237,14 @@ const el = {
   banner: byId('errorBanner'),
   bannerText: byId('bannerText'),
   bannerClose: byId('bannerClose'),
-  overlay: byId('overlay'),
-  overlayText: byId('overlayText'),
-  overlayHint: byId('overlayHint'),
   toastBox: byId('toastBox'),
+  taskToggleBtn: byId('taskToggleBtn'),
+  taskRunDot: byId('taskRunDot'),
+  taskPanel: byId('taskPanel'),
+  taskPanelCount: byId('taskPanelCount'),
+  taskPanelClose: byId('taskPanelClose'),
+  taskList: byId('taskList'),
+  taskEmpty: byId('taskEmpty'),
   tabs: $$('.tab'),
 };
 
@@ -210,14 +267,6 @@ function toast(msg, type = 'ok') {
     setTimeout(() => t.remove(), 350);
   }, 4200);
 }
-
-function showOverlay(text, hint) {
-  el.overlayText.textContent = text;
-  el.overlayHint.textContent = hint || '';
-  el.overlay.hidden = false;
-}
-
-function hideOverlay() { el.overlay.hidden = true; }
 
 /* ---------------- 服务状态 ---------------- */
 
@@ -296,7 +345,6 @@ function loadTab(tab, opts = {}) {
 function makeLoader(tab, render) {
   return async function load(opts = {}) {
     const { force = false, silent = false } = opts;
-    if (state.busy) return;                          // 控制操作进行中，暂停数据加载
     const hasData = state.data[tab] != null;
     if (!force && hasData && !state.dirty[tab]) { render(); return; }
 
@@ -323,6 +371,7 @@ const LOADERS = {
   raw: makeLoader('raw', () => renderSnapshot('raw')),
   cleaned: makeLoader('cleaned', () => renderSnapshot('cleaned')),
   ai: makeLoader('ai', renderAi),
+  'ai-runs': loadAiRuns,
   sources: makeLoader('sources', renderSources),
   config: makeLoader('config', renderConfig),
   prompts: makeLoader('prompts', renderPromptsList),
@@ -545,6 +594,503 @@ function aiRowHtml(it, rank, compact) {
   return html;
 }
 
+/* ---------------- AI 整理详情（ai-runs） ---------------- */
+
+/** 整理记录列表拉取条数 */
+const AI_RUNS_LIMIT = 50;
+/** 批次「原始数据」子块默认展示条数（可展开全部） */
+const AI_RUN_INPUT_PREVIEW = 5;
+
+/* 整理 run 状态 → 徽章样式与文案 */
+const AI_RUN_STATUS_META = {
+  running: { badge: 'badge-run', text: '运行中' },
+  done: { badge: 'badge-ok', text: '成功' },
+  failed: { badge: 'badge-err', text: '失败' },
+};
+
+/** 折叠箭头（向下；收起时旋转 -90° 指向右侧） */
+const RUN_CHEVRON =
+  '<svg class="run-chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+  '<path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" ' +
+  'stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+/** 读取折叠状态：state.aiRuns.fold[key] 缺省时用默认值 */
+function isFoldOpen(key, defaultOpen) {
+  const v = state.aiRuns.fold[key];
+  return v == null ? defaultOpen : v === true;
+}
+
+/** 列表加载器：带缓存 / 脏标记 / 404 友好空态（接口带 limit 参数，故未用 makeLoader） */
+async function loadAiRuns(opts = {}) {
+  const { force = false, silent = false } = opts;
+  if (state.aiRuns.loading) return;
+  const hasData = state.data['ai-runs'] != null;
+  if (!force && hasData && !state.dirty['ai-runs']) { renderAiRuns(); return; }
+
+  state.aiRuns.loading = true;
+  const btn = byId('ai-runsRefresh');
+  if (!silent) { btn.disabled = true; btn.classList.add('loading'); }
+  if (!hasData) showTabState('ai-runs', 'loading');
+  try {
+    state.data['ai-runs'] = await getJson(API + '/ai-runs?limit=' + AI_RUNS_LIMIT);
+    state.dirty['ai-runs'] = false;
+    renderAiRuns();
+    syncOpenAiRunDetails();
+  } catch (e) {
+    if (e.status === 404) {
+      state.data['ai-runs'] = null;
+      state.dirty['ai-runs'] = false;
+      showTabState('ai-runs', 'empty', e.body || '暂无 AI 整理记录');
+    } else {
+      if (!hasData) showTabState('ai-runs', 'error', e.message);
+      if (!silent) showBanner('加载' + TAB_LABEL['ai-runs'] + '失败：' + e.message);
+    }
+  } finally {
+    state.aiRuns.loading = false;
+    if (!silent) { btn.disabled = false; btn.classList.remove('loading'); }
+  }
+}
+
+/** 单次整理详情（懒加载）：状态变化经签名触发重渲染 */
+async function loadAiRunDetail(runId, opts = {}) {
+  const { silent = false } = opts;
+  const existing = state.aiRuns.detail[runId];
+  if (existing && existing.loading) return;
+  const dt = state.aiRuns.detail[runId] = { loading: true, data: null, error: null };
+  if (!silent) renderAiRuns();
+  try {
+    dt.data = await getJson(API + '/ai-runs/' + encodeURIComponent(runId));
+  } catch (e) {
+    dt.error = e.status === 404 ? (e.body || 'AI 整理记录不存在') : e.message;
+  } finally {
+    dt.loading = false;
+    renderAiRuns();
+  }
+}
+
+/** 视图签名：列表概要 + 各详情关键进度 + 输入条目展开标记（折叠状态不入签名，走就地 class 切换） */
+function aiRunsSig() {
+  const d = state.data['ai-runs'];
+  const runs = Array.isArray(d && d.runs) ? d.runs : [];
+  const list = runs.map((r) => r.runId + ':' + (r.status || '')).join(',');
+  const details = Object.keys(state.aiRuns.detail).sort().map((id) => {
+    const dt = state.aiRuns.detail[id];
+    if (dt.loading) return id + ':L';
+    if (dt.error) return id + ':E';
+    const dd = dt.data || {};
+    const batches = Array.isArray(dd.batches) ? dd.batches : [];
+    const fin = dd.finalize || {};
+    const bSig = batches.map((b) =>
+      (b.aiResponse ? 'r' : '-') + (Array.isArray(b.parsedGroups) ? b.parsedGroups.length : 0)).join('');
+    return id + ':D:' + (dd.status || '') + ':' + batches.length + ':' + bSig + ':' +
+      (dd.finishedAt == null ? '' : String(dd.finishedAt)) + ':' +
+      (dd.total == null ? '' : String(dd.total)) + ':' + String(dd.error || '') + ':' +
+      (fin.sentPayload ? 'p' : '-') + (fin.aiResponse ? 'r' : '-') + ':' +
+      (Array.isArray(fin.parsedFinals) ? fin.parsedFinals.length : 0);
+  }).join('|');
+  return list + '|' + details + '|' + JSON.stringify(state.aiRuns.itemsAll);
+}
+
+/** 渲染整理记录列表（含展开中的详情）；签名无变化且列表在展示时跳过，避免周期静默刷新重建 DOM */
+function renderAiRuns() {
+  const d = state.data['ai-runs'];
+  const runs = Array.isArray(d && d.runs) ? d.runs : [];
+
+  const sig = aiRunsSig();
+  if (sig === state.aiRuns.sig && !byId('ai-runsList').hidden) return;
+  state.aiRuns.sig = sig;
+
+  if (!runs.length) {
+    showTabState('ai-runs', 'empty',
+      '暂无 AI 整理记录：执行「AI整理」或「全流程」后，每次整理的完整调用过程（输入 → payload → AI 返回 → 解析 → 终稿合并）将在此展示');
+    return;
+  }
+
+  byId('ai-runsState').hidden = true;
+  byId('ai-runsList').hidden = false;
+
+  const done = runs.filter((r) => r.status === 'done').length;
+  const failed = runs.filter((r) => r.status === 'failed').length;
+  const running = runs.filter((r) => r.status === 'running').length;
+  byId('ai-runsStats').innerHTML = [
+    statHtml('记录', fmtNum(runs.length)),
+    done ? '<span class="badge badge-ok">成功 ' + done + '</span>' : '',
+    failed ? '<span class="badge badge-err">失败 ' + failed + '</span>' : '',
+    running ? '<span class="badge badge-run">运行中 ' + running + '</span>' : '',
+  ].filter(Boolean).join('');
+
+  byId('ai-runsList').innerHTML = runs.map(aiRunRowHtml).join('');
+}
+
+/** 列表刷新后：展开中且仍在运行（或详情状态落后于列表）的 run，静默刷新其详情 */
+function syncOpenAiRunDetails() {
+  const d = state.data['ai-runs'];
+  const runs = Array.isArray(d && d.runs) ? d.runs : [];
+  runs.forEach((r) => {
+    const id = String(r.runId == null ? '' : r.runId);
+    if (!id || !isFoldOpen(id, false)) return;
+    const dt = state.aiRuns.detail[id];
+    const stale = !!(dt && dt.data && dt.data.status === 'running' && r.status && r.status !== 'running');
+    if ((r.status === 'running' || stale) && !(dt && dt.loading)) {
+      loadAiRunDetail(id, { silent: true });
+    }
+  });
+}
+
+/** ai-runs 页可见时：有 AI 类任务进行中或列表含运行中 run → 随任务轮询节奏静默刷新 */
+function syncAiRunsTasks() {
+  if (state.tab !== 'ai-runs' || !state.autoRefresh) return;
+  const aiActive = (state.tasks.list || []).some((t) =>
+    (t.kind === 'ai' || t.kind === 'run_all') && (t.state === 'pending' || t.state === 'running'));
+  const d = state.data['ai-runs'];
+  const runActive = Array.isArray(d && d.runs) && d.runs.some((r) => r.status === 'running');
+  if (aiActive || runActive) loadAiRuns({ force: true, silent: true });
+}
+
+/** 单条整理记录卡片（头行点击展开 / 收起，展开时懒加载详情） */
+function aiRunRowHtml(r) {
+  const id = String(r.runId == null ? '' : r.runId);
+  const open = isFoldOpen(id, false);
+  const meta = AI_RUN_STATUS_META[r.status] || { badge: 'badge-idle', text: r.status || '未知' };
+  const statusCls = r.status === 'failed' ? ' is-failed' : (r.status === 'running' ? ' is-running' : '');
+  const dt = state.aiRuns.detail[id] || null;
+
+  let body = '';
+  if (dt) {
+    if (dt.loading && !dt.data && !dt.error) {
+      body = '<div class="run-detail-loading"><span class="spinner" aria-hidden="true"></span>' +
+        '<span>正在加载整理详情…</span></div>';
+    } else if (dt.error) {
+      body = '<div class="src-test-error">' + esc(dt.error) + '</div>' +
+        '<div><button type="button" class="btn btn-sm" data-act="reload-detail" data-runid="' + esc(id) +
+        '"><span>重试</span></button></div>';
+    } else {
+      body = aiRunDetailHtml(id, dt.data || {});
+    }
+  }
+
+  return '<article class="ai-run foldable' + statusCls + (open ? '' : ' is-collapsed') +
+    '" data-runid="' + esc(id) + '">' +
+    '<button type="button" class="run-fold-head ai-run-head" data-fold="' + esc(id) +
+      '" data-def="closed" aria-expanded="' + open + '">' +
+      RUN_CHEVRON +
+      '<span class="ai-run-id">' + esc(id) + '</span>' +
+      '<span class="badge ' + meta.badge + '">' + esc(meta.text) + '</span>' +
+      (r.model ? '<span class="chip mono" title="模型">' + esc(r.model) + '</span>' : '') +
+      '<span class="chip">输入 ' + fmtNum(r.sourceItemCount) + ' 条</span>' +
+      (r.batchCount != null ? '<span class="chip">' + fmtNum(countOf(r.batchCount)) + ' 批</span>' : '') +
+      (r.status === 'done' && r.total != null ? '<span class="chip">结果 ' + fmtNum(countOf(r.total)) + ' 条</span>' : '') +
+      '<span class="ai-run-time">' + esc(fmtTime(r.startedAt)) +
+        (r.finishedAt ? ' → ' + esc(fmtTime(r.finishedAt)) : '') + '</span>' +
+    '</button>' +
+    (r.status === 'failed' && r.error
+      ? '<div class="ai-run-error" title="' + esc(r.error) + '">' + esc(r.error) + '</div>' : '') +
+    '<div class="run-fold-body ai-run-body">' + body + '</div>' +
+    '</article>';
+}
+
+/** 单次整理详情：概览头 + 批次区块 + 终稿合并区块 */
+function aiRunDetailHtml(runId, d) {
+  const meta = AI_RUN_STATUS_META[d.status] || { badge: 'badge-idle', text: d.status || '未知' };
+  const batches = Array.isArray(d.batches) ? d.batches : [];
+  const cats = Array.isArray(d.categories) ? d.categories : [];
+
+  const overview = '<div class="run-overview">' +
+    '<span class="badge ' + meta.badge + '">' + esc(meta.text) + '</span>' +
+    statHtml('runId', esc(runId)) +
+    statHtml('模型', esc(String(d.model || '—'))) +
+    statHtml('开始', esc(fmtTime(d.startedAt))) +
+    statHtml('结束', esc(fmtTime(d.finishedAt))) +
+    statHtml('输入条数', fmtNum(d.sourceItemCount)) +
+    statHtml('批次数', fmtNum(d.batchCount != null ? countOf(d.batchCount) : batches.length)) +
+    (d.total != null ? statHtml('结果 total', fmtNum(countOf(d.total))) : '') +
+    (cats.length ? statHtml('领域', esc(cats.join('、'))) : '') +
+    (d.cleanedFromRunId ? statHtml('清洗来源', esc(String(d.cleanedFromRunId))) : '') +
+    '</div>';
+
+  const errBanner = (d.status === 'failed' && d.error)
+    ? '<div class="run-error-banner" title="' + esc(d.error) + '">整理失败：' + esc(d.error) + '</div>' : '';
+
+  // 发送给 AI 的系统提示词（主提示词 + 终稿提示词，trace 顶层记录）
+  const promptsHtml = aiPromptsHtml(runId, d);
+
+  const batchHtml = batches.length
+    ? '<div class="run-batches">' + batches.map((b) => aiBatchHtml(runId, b)).join('') + '</div>'
+    : '<div class="src-empty-mini">暂无批次记录</div>';
+
+  // 操作条：失败批次重试后 / 想基于当前成功批重新合并时，续跑终稿产出榜单
+  const failedBatches = batches.filter((b) => b.status === 'error' || b.error);
+  const okGroupCount = batches.filter((b) => b.status === 'ok').reduce((n, b) => n + (b.parsedGroups || []).length, 0);
+  const actionBar = '<div class="run-action-bar">' +
+    (failedBatches.length
+      ? '<span class="chip chip-warn">' + failedBatches.length + ' 批失败</span>' : '') +
+    '<button type="button" class="btn btn-sm" data-act="finalize-run" data-runid="' + esc(runId) + '"' +
+      (okGroupCount < 1 ? ' disabled title="无成功批次，先重试失败批次"' : ' title="基于当前全部成功批次重新做终稿合并并产出榜单（成功批次也可重新生成）"') + '>' +
+      '<span class="btn-spin" aria-hidden="true"></span><span>续跑终稿合并</span></button>' +
+    (d.status === 'failed'
+      ? '<span class="hint">提示：点各失败批「重试该批」后再「续跑终稿合并」，无需整次重来</span>' : '') +
+    '</div>';
+
+  return overview + promptsHtml + actionBar + errBanner + batchHtml + aiFinalizeHtml(runId, d.finalize);
+}
+
+/** 本次整理发送给 AI 的系统提示词区块（主 + 终稿，trace 顶层记录，可折叠展开查看原文） */
+function aiPromptsHtml(runId, d) {
+  const sysP = d.systemPrompt;
+  const finP = d.finalizePrompt;
+  if (!sysP && !finP) return '';
+  const key = runId + ':prompts';
+  const open = isFoldOpen(key, true); // 默认展开（提示词通常不长，便于直接查看）
+  let body = '';
+  if (sysP) body += aiSecPreHtml(key + ':sys', '主提示词（system prompt，每批发送）', sysP);
+  if (finP) body += aiSecPreHtml(key + ':fin', '终稿提示词（finalize prompt）', finP);
+  if (!body) return '';
+  return '<section class="run-batch run-prompts foldable' + (open ? '' : ' is-collapsed') + '">' +
+    '<button type="button" class="run-fold-head" data-fold="' + esc(key) + '" data-def="open" aria-expanded="' + open + '">' +
+      RUN_CHEVRON +
+      '<span class="run-batch-title">系统提示词</span>' +
+      '<span class="chip">' + (sysP ? '主 · ' + fmtNum(String(sysP).length) + ' 字符' : '') +
+        (finP ? ' 终稿 · ' + fmtNum(String(finP).length) + ' 字符' : '') + '</span>' +
+    '</button>' +
+    '<div class="run-fold-body">' + body + '</div>' +
+    '</section>';
+}
+
+/** 单个批次区块（默认展开；左侧批序号色条） */
+function aiBatchHtml(runId, b) {
+  const idxStr = String(b.batchIndex == null ? '?' : b.batchIndex);
+  const key = runId + ':b' + idxStr;
+  const open = isFoldOpen(key, true);
+  const items = Array.isArray(b.inputItems) ? b.inputItems : [];
+  const groups = Array.isArray(b.parsedGroups) ? b.parsedGroups : [];
+  const inputCount = b.inputItemCount != null ? countOf(b.inputItemCount) : items.length;
+
+  let statusHtml;
+  if (b.error) statusHtml = '<span class="badge badge-err">该批出错</span>';
+  else if (b.aiResponse || groups.length) statusHtml = '<span class="badge badge-ok">成功</span>';
+  else statusHtml = '<span class="badge badge-idle">待处理</span>';
+
+  return '<section class="run-batch foldable' + (b.error ? ' is-failed' : '') + (open ? '' : ' is-collapsed') + '" data-runid="' + esc(runId) + '" data-batch="' + esc(idxStr) + '">' +
+    '<div class="run-head-row">' +
+      '<button type="button" class="run-fold-head" data-fold="' + esc(key) + '" data-def="open" aria-expanded="' + open + '">' +
+        RUN_CHEVRON +
+        '<span class="run-batch-title">第 ' + esc(idxStr) + ' 批</span>' +
+        statusHtml +
+        '<span class="chip">输入 ' + fmtNum(inputCount) + ' 条</span>' +
+        (groups.length ? '<span class="chip">解析 ' + groups.length + ' 组</span>' : '') +
+      '</button>' +
+      '<button type="button" class="btn btn-sm btn-plain run-batch-retry" data-act="retry-batch" ' +
+        'data-runid="' + esc(runId) + '" data-batch="' + esc(idxStr) + '"' +
+        (b.error ? ' data-reason="failed"' : '') + ' title="' +
+        (b.error ? '该批请求失败，点击重新请求' : '重新请求该批（成功也可重新生成）') + '">' +
+        '<span class="btn-spin" aria-hidden="true"></span><span>' + (b.error ? '重试该批' : '重新生成') + '</span></button>' +
+    '</div>' +
+    (b.error ? '<div class="ai-run-error" title="' + esc(b.error) + '">' + esc(b.error) + '</div>' : '') +
+    '<div class="run-fold-body">' +
+      aiSecInputHtml(key, items) +
+      aiSecPreHtml(key + ':payload', '发送给 AI 的数据（payload）', b.sentPayload) +
+      aiSecPreHtml(key + ':response', 'AI 返回', b.aiResponse) +
+      aiSecGroupsHtml(key + ':groups', '解析结果（组）', groups) +
+    '</div>' +
+    '</section>';
+}
+
+/** 终稿合并区块：单批无终稿时仅显示 note */
+function aiFinalizeHtml(runId, fin) {
+  if (!fin) return '';
+  const key = runId + ':fin';
+  const open = isFoldOpen(key, true);
+  const finals = Array.isArray(fin.parsedFinals) ? fin.parsedFinals : [];
+  const hasPayload = fin.sentPayload != null && fin.sentPayload !== '';
+  const hasResponse = fin.aiResponse != null && fin.aiResponse !== '';
+  const hasCall = hasPayload || hasResponse;
+
+  let body = '';
+  if (fin.note) body += '<div class="run-fin-note">' + esc(fin.note) + '</div>';
+  if (hasPayload) body += aiSecPreHtml(key + ':payload', '发送给 AI 的数据（payload）', fin.sentPayload);
+  if (hasResponse) body += aiSecPreHtml(key + ':response', 'AI 返回', fin.aiResponse);
+  if (finals.length || hasCall) body += aiSecGroupsHtml(key + ':finals', '解析结果（终稿）', finals);
+  if (!body) body = '<div class="src-empty-mini">无终稿记录</div>';
+
+  return '<section class="run-batch run-finalize foldable' + (open ? '' : ' is-collapsed') + '">' +
+    '<button type="button" class="run-fold-head" data-fold="' + esc(key) + '" data-def="open" aria-expanded="' + open + '">' +
+      RUN_CHEVRON +
+      '<span class="run-batch-title">终稿合并</span>' +
+      (hasCall ? '<span class="chip">终稿 ' + finals.length + ' 组</span>' : '<span class="chip">未执行</span>') +
+    '</button>' +
+    '<div class="run-fold-body">' + body + '</div>' +
+    '</section>';
+}
+
+/** 通用折叠子块骨架 */
+function runSecHtml(key, open, title, countText, bodyHtml, defOpen) {
+  return '<section class="run-sec foldable' + (open ? '' : ' is-collapsed') + '">' +
+    '<button type="button" class="run-fold-head" data-fold="' + esc(key) + '" data-def="' +
+      (defOpen ? 'open' : 'closed') + '" aria-expanded="' + open + '">' +
+      RUN_CHEVRON +
+      '<span class="run-sec-title">' + esc(title) + '</span>' +
+      (countText ? '<span class="run-sec-count">' + esc(countText) + '</span>' : '') +
+    '</button>' +
+    '<div class="run-fold-body">' + bodyHtml + '</div>' +
+    '</section>';
+}
+
+/** 子块：原始数据（输入该批的清洗条目，默认展开前几条，可展开全部） */
+function aiSecInputHtml(batchKey, items) {
+  const key = batchKey + ':input';
+  const open = isFoldOpen(key, true);
+  const allKey = batchKey + ':input-all';
+  const showAll = !!state.aiRuns.itemsAll[allKey];
+  const limit = showAll ? items.length : Math.min(items.length, AI_RUN_INPUT_PREVIEW);
+
+  let body;
+  if (!items.length) {
+    body = '<div class="src-empty-mini">该批无输入条目</div>';
+  } else {
+    body = '<div class="table-wrap run-items-wrap"><table><thead><tr>' +
+        '<th class="td-title">标题</th><th>来源</th><th>领域</th>' +
+        '<th class="td-num">热度</th><th>摘要</th>' +
+        '</tr></thead><tbody>' + items.slice(0, limit).map(aiInputRowHtml).join('') + '</tbody></table></div>' +
+      (items.length > AI_RUN_INPUT_PREVIEW
+        ? '<button type="button" class="btn btn-sm" data-act="toggle-items" data-key="' + esc(allKey) + '">' +
+          (showAll ? '收起' : '展开全部 ' + items.length + ' 条') + '</button>'
+        : '');
+  }
+  return runSecHtml(key, open, '原始数据（输入该批的清洗条目）',
+    items.length ? '共 ' + items.length + ' 条' : '', body, true);
+}
+
+function aiInputRowHtml(it) {
+  const url = safeUrl(it && it.url);
+  const title = (it && it.title) == null ? '—' : it.title;
+  const titleHtml = url
+    ? '<a class="link" href="' + esc(url) + '" target="_blank" rel="noopener" title="' + esc(title) + '">' + esc(title) + '</a>'
+    : '<span title="' + esc(title) + '">' + esc(title) + '</span>';
+  return '<tr>' +
+    '<td class="td-trunc td-title">' + titleHtml + '</td>' +
+    '<td class="td-trunc" title="' + esc(it && it.source) + '">' + esc((it && it.source) || '—') + '</td>' +
+    '<td class="td-trunc" title="' + esc(it && it.domain) + '">' + esc((it && it.domain) || '—') + '</td>' +
+    '<td class="td-num">' + esc(fmtHeat(it)) + '</td>' +
+    '<td class="td-trunc" title="' + esc(it && it.summary) + '">' + esc((it && it.summary) || '—') + '</td>' +
+    '</tr>';
+}
+
+/** 子块：payload / AI 返回（大文本，默认收起，pre 深底等宽可横向滚动） */
+function aiSecPreHtml(key, title, text) {
+  const open = isFoldOpen(key, false);
+  const s = text == null ? '' : String(text);
+  const body = s
+    ? '<pre class="run-pre">' + esc(s) + '</pre>'
+    : '<div class="src-empty-mini">（空）</div>';
+  return runSecHtml(key, open, title, s ? fmtNum(s.length) + ' 字符' : '', body, false);
+}
+
+/** 子块：解析结果（组 / 终稿），紧凑列表 */
+function aiSecGroupsHtml(key, title, groups) {
+  const open = isFoldOpen(key, true);
+  const body = groups.length
+    ? '<div class="run-groups">' + groups.map(aiGroupHtml).join('') + '</div>'
+    : '<div class="src-empty-mini">未解析出组</div>';
+  return runSecHtml(key, open, title, '共 ' + groups.length + ' 组', body, true);
+}
+
+/** 单个解析组：组标题 / 热度 / 来源 / 输入序号 / 摘要 */
+function aiGroupHtml(g) {
+  const title = g.title || g.name || g.topic || '未命名组';
+  const label = String(g.heatLabel || '');
+  let labelHtml = '';
+  if (label) {
+    let lc = label.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    if (!KNOWN_HEAT_LABELS.includes(lc)) lc = 'normal';
+    labelHtml = '<span class="badge heat-' + lc + '">' + esc(label) + '</span>';
+  }
+  const heatNum = Number(g.heat);
+  const heatHtml = (g.heat != null && Number.isFinite(heatNum))
+    ? '<span class="heat-val">' + esc(String(g.heat)) + '</span>' : '';
+  const srcs = (Array.isArray(g.sources) ? g.sources : []).map((s) =>
+    '<span class="chip chip-src">' + esc(typeof s === 'string' ? s : (s.name || s.source || '')) + '</span>').join('');
+  const idx = (Array.isArray(g.inputIndexes) ? g.inputIndexes : []).map((n) =>
+    '<span class="chip mono">#' + esc(String(n)) + '</span>').join('');
+  const itemsChip = Array.isArray(g.items) ? '<span class="chip">条目 ' + g.items.length + '</span>' : '';
+  const summary = g.summary
+    ? '<p class="rank-summary" title="' + esc(g.summary) + '">' + esc(g.summary) + '</p>' : '';
+
+  return '<div class="run-group">' +
+    '<div class="run-group-line1">' +
+      '<span class="run-group-title" title="' + esc(title) + '">' + esc(title) + '</span>' +
+      labelHtml + heatHtml + itemsChip +
+    '</div>' +
+    (srcs || idx ? '<div class="rank-chips">' + srcs + idx + '</div>' : '') +
+    summary +
+    '</div>';
+}
+
+/** 列表点击委托：折叠头切换（就地 class 更新，不重建 DOM）+ 懒加载详情 + 展开全部 / 重试 */
+function onAiRunsListClick(e) {
+  const foldBtn = e.target.closest('[data-fold]');
+  if (foldBtn) {
+    const key = foldBtn.dataset.fold;
+    const defOpen = foldBtn.dataset.def !== 'closed';
+    const wasOpen = isFoldOpen(key, defOpen);
+    state.aiRuns.fold[key] = !wasOpen;
+    const box = foldBtn.closest('.foldable');
+    if (box) box.classList.toggle('is-collapsed', wasOpen);
+    foldBtn.setAttribute('aria-expanded', String(!wasOpen));
+    if (!wasOpen && foldBtn.classList.contains('ai-run-head') && !state.aiRuns.detail[key]) {
+      loadAiRunDetail(key);
+    }
+    return;
+  }
+
+  const actBtn = e.target.closest('button[data-act]');
+  if (!actBtn || actBtn.disabled) return;
+  const act = actBtn.dataset.act;
+  if (act === 'reload-detail') {
+    loadAiRunDetail(actBtn.dataset.runid);
+  } else if (act === 'toggle-items') {
+    const k = actBtn.dataset.key;
+    state.aiRuns.itemsAll[k] = !state.aiRuns.itemsAll[k];
+    renderAiRuns();
+  } else if (act === 'retry-batch' || act === 'finalize-run') {
+    submitAiRunTask(act, actBtn.dataset.runid, actBtn.dataset.batch);
+  }
+}
+
+/**
+ * 提交 单批重试 / 续跑终稿 后台任务（需求：部分批次失败可单独重试，不必全部重来）。
+ * 任务完成后自动刷新该 run 详情与 AI 结果。
+ */
+async function submitAiRunTask(act, runId, batchIndex) {
+  const btn = act === 'retry-batch'
+    ? document.querySelector('.run-batch[data-runid="' + CSS.escape(runId) + '"][data-batch="' + CSS.escape(batchIndex || '') + '"] [data-act="retry-batch"]')
+    : document.querySelector('.run-action-bar [data-act="finalize-run"][data-runid="' + CSS.escape(runId) + '"]');
+  if (btn) { btn.disabled = true; btn.classList.add('loading'); }
+  try {
+    const path = act === 'retry-batch'
+      ? API + '/ai-runs/' + encodeURIComponent(runId) + '/retry-batch'
+      : API + '/ai-runs/' + encodeURIComponent(runId) + '/finalize';
+    const opts = act === 'retry-batch'
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ batchIndex: Number(batchIndex) }) }
+      : { method: 'POST' };
+    const res = await request(path, opts).then((r) => r.json());
+    if (res.ok === false) throw new ApiError(res.error || '提交失败', 500);
+    toast((act === 'retry-batch' ? '批次 ' + batchIndex + ' 重试已提交' : '续跑终稿合并已提交') + '，后台执行中');
+    openTaskPanel?.();
+    pollTasks?.();
+    // 该 run 的详情在任务完成后随列表刷新同步更新
+    state.aiRuns.fold[runId] = true;   // 保持展开状态
+    state.dirty['ai-runs'] = true;
+  } catch (err) {
+    if (err.status === 409) {
+      showBanner('已有该整理记录的重试/续跑任务在运行');
+    } else {
+      showBanner((act === 'retry-batch' ? '重试批次失败：' : '续跑失败：') + err.message);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('loading'); }
+  }
+}
+
 /* ---------------- 数据源可用性 ---------------- */
 
 function renderSources() {
@@ -728,7 +1274,6 @@ const SRC_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 async function loadManage(opts = {}) {
   const { force = false, silent = false } = opts;
-  if (state.busy) return;
   loadRsshubInstances();                       // RSSHub 实例列表独立加载（内部缓存，失败互不影响）
   const hasData = state.data.manage != null;
   if (!force && hasData && !state.dirty.manage) { renderManage(); return; }
@@ -809,7 +1354,7 @@ function srcCardHtml(s) {
   const f = state.manage.fetch[id] || null;
   const g = state.manage.toggle[id] || null;
   const testing = !!(t && t.loading);
-  const fetching = !!(f && f.loading);
+  const fetching = !!(f && (f.state === 'pending' || f.state === 'running'));
   const toggling = !!(g && g.loading);
   const name = s.name == null ? id : s.name;
 
@@ -855,21 +1400,38 @@ function srcCardHtml(s) {
     '</article>';
 }
 
+/** 单源获取任务在卡片内的就地展示：迷你进度条 / 结果 / 错误 */
 function srcFetchHtml(f) {
-  if (f.loading) {
-    return '<div class="src-fetch-res is-loading"><span class="spinner" aria-hidden="true"></span>' +
-      '<span>正在单独获取并并入最近快照…</span></div>';
+  const st = f.state;
+  if (st === 'pending' || st === 'running') {
+    const pct = clampPct(f.progress);
+    const stageTxt = [f.stage, f.message].filter(Boolean).map(esc).join(' · ') || '任务已提交，等待执行…';
+    return '<div class="src-fetch-res is-loading">' +
+      '<span class="badge ' + (st === 'running' ? 'badge-run' : 'badge-idle') + '">' +
+        (st === 'running' ? '运行中' : '排队') + '</span>' +
+      '<div class="src-fetch-progress">' +
+        '<div class="progress progress-thin"><div class="progress-fill task-fill' +
+          (st === 'running' ? ' is-running' : ' is-pending') + '" style="width:' + pct + '%"></div></div>' +
+        '<span class="task-pct">' + pct + '%</span>' +
+      '</div>' +
+      '<span class="src-fetch-text">' + stageTxt + '</span>' +
+    '</div>';
   }
-  if (f.error) {
+  if (st === 'failed') {
     return '<div class="src-fetch-res is-err"><span class="badge badge-err">单独获取失败</span>' +
-      '<span class="src-fetch-text">' + esc(f.error) + '</span></div>';
+      '<span class="src-fetch-text">' + esc(f.error || '未知错误') + '</span></div>';
   }
-  const d = f.data || {};
+  if (st === 'cancelled') {
+    return '<div class="src-fetch-res is-err"><span class="badge badge-idle">已取消</span>' +
+      '<span class="src-fetch-text">单独获取任务已取消</span></div>';
+  }
+  const bits = [];
+  if (f.sourceCount != null) bits.push('本源条数 <span class="src-meta-v">' + fmtNum(f.sourceCount) + '</span>');
+  if (f.detail) bits.push(esc(f.detail));
   return '<div class="src-fetch-res">' +
     '<span class="badge badge-ok">已并入快照</span>' +
-    '<span class="src-fetch-text">合并后总条数 <span class="src-meta-v">' + fmtNum(d.items) + '</span>' +
-    ' · 本源条数 <span class="src-meta-v">' + fmtNum(f.sourceCount) + '</span>' +
-    ' · ' + (d.partial ? '部分合并（仅更新该源数据）' : '完整快照') + '</span></div>';
+    '<span class="src-fetch-text">' +
+      (bits.length ? bits.join(' · ') : '可继续执行数据清洗 / AI 整理') + '</span></div>';
 }
 
 function srcTestHtml(t) {
@@ -963,8 +1525,16 @@ async function testSource(id) {
   }
 }
 
+/** 单独获取：提交后台任务（多源可并行），卡片内就地展示迷你进度 */
 async function fetchSource(id) {
-  state.manage.fetch[id] = { loading: true, data: null, error: null, sourceCount: null };
+  const existing = state.manage.fetch[id];
+  if (existing && (existing.state === 'pending' || existing.state === 'running')) return;   // 该源任务进行中
+  const src = findSource(id);
+  const name = src && src.name ? src.name : id;
+  state.manage.fetch[id] = {
+    taskId: null, state: 'pending', progress: 0, stage: '',
+    message: '任务提交中…', error: null, sourceCount: null, detail: '',
+  };
   renderManage();
   const f = state.manage.fetch[id];
   try {
@@ -973,22 +1543,18 @@ async function fetchSource(id) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ force: true }),
     }).then((r) => r.json());
-    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 500);
-    f.data = res;
-    markDirty('raw', 'sources');
-    // 单独获取接口不返回分源计数，从数据源可用性接口补取该源最新条数
-    try {
-      const avail = await getJson(API + '/sources');
-      const st = (avail && Array.isArray(avail.sources) ? avail.sources : []).find((x) => x.source === id);
-      f.sourceCount = st ? countOf(st.itemCount) : null;
-    } catch (_) { /* 可用性查询失败不影响主结果展示 */ }
-    toast('已并入最近快照，可继续执行数据清洗 / AI 整理');
+    if (res.ok === false || !res.taskId) throw new ApiError(res.error || '服务端未返回任务号', 500);
+    f.taskId = res.taskId;
+    f.message = '任务已提交，等待执行…';
+    state.tasks.srcMap[res.taskId] = res.sourceId || id;
+    toast('任务已提交：单独获取 ' + name);
+    pollTasks();                                     // 立即开始跟踪进度
   } catch (e) {
-    f.error = e.message;
-  } finally {
-    f.loading = false;
-    renderManage();
+    f.state = 'failed';
+    f.error = apiErrMsg(e);
+    if (e.status !== 409) showBanner('单独获取 ' + name + ' 提交失败：' + e.message);
   }
+  renderManage();
 }
 
 async function deleteSource(id, btn) {
@@ -1253,7 +1819,7 @@ function rsshubRowHtml(inst) {
   const durTip = inst.statusCode != null ? 'HTTP ' + inst.statusCode : '';
   const href = safeUrl(url);
 
-  return '<tr>' +
+  return '<tr data-url="' + esc(url) + '">' +
     '<td class="td-trunc td-title mono" title="' + esc(url) + '">' + (href
       ? '<a class="link" href="' + esc(href) + '" target="_blank" rel="noopener">' + esc(url) + '</a>'
       : esc(url || '—')) + '</td>' +
@@ -1275,11 +1841,11 @@ function rsshubRowHtml(inst) {
 }
 
 /** 测试单个实例在线状态（url 以 encodeURIComponent 完整编码，含 https:// 前缀） */
-async function testRsshubInstance(url) {
+async function testRsshubInstance(url, quiet = false) {
   const r = state.manage.rsshub;
   if (!url || r.testing[url]) return;
   r.testing[url] = true;
-  renderRsshub();
+  if (!quiet) renderRsshub();
   try {
     const res = await request(API + '/rsshub/test/' + encodeURIComponent(url), {
       method: 'POST',
@@ -1295,11 +1861,31 @@ async function testRsshubInstance(url) {
     showBanner('测试 RSSHub 实例失败：' + e.message);
   } finally {
     delete r.testing[url];
-    renderRsshub();
+    // quiet 模式（并发批量）下仅更新该行，避免频繁全表重建
+    if (!quiet) renderRsshub();
+    else updateRsshubRow(url);
   }
 }
 
-/** 全部测试：顺序遍历实例，每完成一个即更新该行状态 */
+/** 只重渲染单个实例行（并发测试时避免整表频繁重建闪烁） */
+function updateRsshubRow(url) {
+  const r = state.manage.rsshub;
+  const list = Array.isArray(r.instances) ? r.instances : [];
+  const tbody = byId('rsshubTbody');
+  if (!tbody) return;
+  const row = tbody.querySelector('tr[data-url="' + CSS.escape(url) + '"]');
+  const inst = list.find((x) => x.url === url);
+  if (row && inst) {
+    const tmp = document.createElement('tbody');
+    tmp.innerHTML = rsshubRowHtml(inst);
+    row.replaceWith(tmp.firstElementChild);
+  }
+}
+
+/**
+ * 全部测试：并行并发测试所有实例（每个实例独立发起探测请求，互不阻塞）。
+ * 各实例完成后独立更新对应行状态与进度；全部结束后统一提示。
+ */
 async function testAllRsshubInstances() {
   const r = state.manage.rsshub;
   const list = Array.isArray(r.instances) ? r.instances.slice() : [];
@@ -1307,10 +1893,13 @@ async function testAllRsshubInstances() {
   r.testingAll = true;
   renderRsshub();
   try {
-    for (const inst of list) {
-      await testRsshubInstance(String(inst.url || ''));
-    }
-    toast('RSSHub 实例测试完成：共 ' + list.length + ' 个');
+    const urls = list.map((inst) => String(inst.url || '')).filter(Boolean);
+    // 并发发起所有测试（quiet：每完成只更新该行，不整表重建；Promise.allSettled 容错单实例失败）
+    await Promise.allSettled(urls.map((url) => testRsshubInstance(url, true)));
+    renderRsshub();
+    const done = urls.length;
+    const onlineCount = (r.instances || []).filter((i) => i.online === true).length;
+    toast('RSSHub 实例测试完成：' + onlineCount + '/' + done + ' 个在线');
   } finally {
     r.testingAll = false;
     renderRsshub();
@@ -1324,60 +1913,312 @@ function onRsshubTbodyClick(e) {
   testRsshubInstance(btn.dataset.url);
 }
 
-/* ---------------- 控制操作（获取 / 清洗 / AI / 全流程） ---------------- */
-
-function setControlsDisabled(dis) {
-  [el.btnFetch, el.btnClean, el.btnAi, el.btnRunAll].forEach((b) => { b.disabled = dis; });
-  el.forceChk.disabled = dis;
-}
+/* ---------------- 后台任务：提交 / 轮询 / 进度面板 ---------------- */
 
 function markDirty() {
   for (const t of arguments) state.dirty[t] = true;
 }
 
-/**
- * 执行控制类操作：期间显示全屏遮罩并禁用全部控制按钮。
- * @param {HTMLElement} btn   触发按钮（显示行内 spinner）
- * @param {string} path       接口路径
- * @param {object} body       POST body
- * @param {string} label      操作名（用于错误提示）
- * @param {string} overlayText  遮罩主文案
- * @param {string} overlayHint  遮罩副文案
- * @param {Function} onOk     成功回调
- */
-async function runControl(btn, path, body, label, overlayText, overlayHint, onOk) {
-  if (state.busy) return;
-  state.busy = true;
-  setControlsDisabled(true);
+/** 去掉 ApiError 消息里的 "HTTP xxx：" 前缀，用于卡片 / 横幅展示 */
+function apiErrMsg(e) {
+  return String(e && e.message ? e.message : '').replace(/^HTTP \d+：/, '') || '未知错误';
+}
+
+/** 任务进度值（0-100）安全化 */
+function clampPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+/** 任务 detail 摘要（完成提示 / 面板 / 卡片展示用） */
+function detailText(d) {
+  if (d == null) return '';
+  if (typeof d === 'string') return d.length > 90 ? d.slice(0, 90) + '…' : d;
+  if (typeof d === 'object') {
+    const parts = [];
+    if (d.items != null) parts.push(countOf(d.items) + ' 条');
+    if (d.total != null && d.total !== d.items) parts.push('共 ' + countOf(d.total) + ' 条');
+    if (parts.length) return parts.join(' · ');
+    try {
+      const s = JSON.stringify(d);
+      return s.length > 90 ? s.slice(0, 90) + '…' : s;
+    } catch (_) { return ''; }
+  }
+  return String(d);
+}
+
+/** querySelector 属性值转义（无 CSS.escape 时的回退） */
+function cssEscape(s) {
+  return window.CSS && CSS.escape ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, '\\$&');
+}
+
+/** 提交流水线任务：接口立即返回 taskId，进度由任务轮询跟踪（不锁页面） */
+async function submitTask(path, body, label, btn) {
+  if (btn.disabled) return;
+  btn.disabled = true;
   btn.classList.add('loading');
-  showOverlay(overlayText, overlayHint);
   try {
-    const res = await request(path, {
+    const res = await request(API + path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     }).then((r) => r.json());
-    if (res.ok === false) throw new ApiError(res.error || '服务端返回 ok=false', 500);
-    onOk(res);
-    hideBanner();
+    if (res.ok === false || !res.taskId) throw new ApiError(res.error || '服务端未返回任务号', 500);
+    toast('任务已提交：' + label);
+    openTaskPanel();
   } catch (e) {
-    showBanner(label + '失败：' + e.message);
+    if (e.status === 409) {
+      if (e.json && e.json.conflictTaskId) state.tasks.highlight = e.json.conflictTaskId;
+      showBanner('已有任务在运行，请等待其完成后再提交（' + apiErrMsg(e) + '）');
+      openTaskPanel();
+    } else {
+      showBanner(label + '提交失败：' + e.message);
+    }
   } finally {
-    state.busy = false;
-    btn.classList.remove('loading');
-    setControlsDisabled(false);
-    hideOverlay();
-    refreshStatus(true);
-    if (DATA_TABS.includes(state.tab)) LOADERS[state.tab]({ force: true });
+    await pollTasks();                               // 立即刷新任务列表与按钮状态（含冲突高亮）
+    updateControlButtons();
   }
+}
+
+/** 依据流水线运行状态统一刷新控制按钮：运行中全部禁用，对应按钮转圈 */
+function updateControlButtons() {
+  const running = state.tasks.running;
+  const kindBtn = { fetch_all: el.btnFetch, clean: el.btnClean, ai: el.btnAi, run_all: el.btnRunAll };
+  [el.btnFetch, el.btnClean, el.btnAi, el.btnRunAll].forEach((b) => {
+    b.disabled = !!running;
+    b.classList.remove('loading');
+  });
+  if (running && kindBtn[running.kind]) kindBtn[running.kind].classList.add('loading');
+}
+
+function taskActive() {
+  return (state.tasks.list || []).some((t) => t.state === 'pending' || t.state === 'running');
+}
+
+function scheduleTaskPoll() {
+  clearTimeout(state.tasks.timer);
+  state.tasks.timer = setTimeout(pollTasks, taskActive() ? TASK_POLL_FAST : TASK_POLL_SLOW);
+}
+
+/** 拉取任务列表并应用；进行中的请求去重复用；页面隐藏时跳过（回到页面立即补拉） */
+function pollTasks() {
+  if (state.tasks.pollP) return state.tasks.pollP;
+  if (document.hidden) { scheduleTaskPoll(); return Promise.resolve(); }
+  const p = (async () => {
+    try {
+      const d = await getJson(API + '/tasks?limit=' + TASK_LIST_LIMIT);
+      if (d && Array.isArray(d.tasks)) applyTasks(d.tasks, d.running || null);
+    } catch (_) { /* 网络失败：静默，下轮重试 */ }
+  })().finally(() => {
+    state.tasks.pollP = null;
+    scheduleTaskPoll();
+  });
+  state.tasks.pollP = p;
+  return p;
+}
+
+/** 应用最新任务列表：检测状态转换 → 刷新数据 / 提示；同步单源任务到管理页 */
+function applyTasks(tasks, running) {
+  const seen = state.tasks.seen;
+  for (const t of tasks) {
+    const prev = seen[t.taskId];
+    if (prev === 'pending' || prev === 'running') {
+      if (t.state === 'done') onTaskDone(t);
+      else if (t.state === 'failed') onTaskFailed(t);
+      else if (t.state === 'cancelled') onTaskCancelled(t);
+    }
+    seen[t.taskId] = t.state;
+  }
+  state.tasks.list = tasks.slice();
+
+  let pipeline = tasks.find((t) =>
+    PIPELINE_KINDS.includes(t.kind) && (t.state === 'pending' || t.state === 'running')) || null;
+  if (!pipeline && running && (running.state === 'pending' || running.state === 'running')) {
+    pipeline = running;
+  }
+  state.tasks.running = pipeline;
+
+  syncSourceTasks(tasks);
+  renderTaskPanel();
+  updateControlButtons();
+  renderManageTasks();
+  syncAiRunsTasks();
+}
+
+function onTaskDone(t) {
+  const tabs = TASK_REFRESH[t.kind] || [];
+  if (tabs.length) {
+    markDirty(...tabs);
+    if (DATA_TABS.includes(state.tab) && tabs.includes(state.tab)) {
+      LOADERS[state.tab]({ force: true });
+    }
+  }
+  const extra = detailText(t.detail);
+  toast(t.label + ' 完成' + (extra ? '：' + extra : ''));
+  if (t.kind === 'fetch_source') void finishSourceFetch(t);
+  refreshStatus(true);
+}
+
+function onTaskFailed(t) {
+  if (t.kind === 'fetch_source') return;             // 单源任务失败在卡片内展示（syncSourceTasks 已写入）
+  showBanner(t.label + ' 失败：' + (t.error || '未知错误'));
+}
+
+function onTaskCancelled(t) {
+  toast(t.label + ' 已取消', 'warn');
+}
+
+/** 单源获取完成：补取该源最新条数并刷新卡片展示 */
+async function finishSourceFetch(t) {
+  const sid = t.sourceId || state.tasks.srcMap[t.taskId];
+  if (!sid) return;
+  const f = state.manage.fetch[sid];
+  if (!f) return;
+  f.state = 'done';
+  f.error = null;
+  f.detail = detailText(t.detail);
+  try {
+    const avail = await getJson(API + '/sources');
+    const st = (avail && Array.isArray(avail.sources) ? avail.sources : []).find((x) => x.source === sid);
+    f.sourceCount = st ? countOf(st.itemCount) : null;
+  } catch (_) { /* 可用性查询失败不影响主结果展示 */ }
+  if (state.tab === 'manage' && state.data.manage != null) renderManage();
+}
+
+/** 将 fetch_source 任务同步到 state.manage.fetch（仅跟踪本页提交的任务） */
+function syncSourceTasks(tasks) {
+  for (const t of tasks) {
+    if (t.kind !== 'fetch_source') continue;
+    const sid = t.sourceId || state.tasks.srcMap[t.taskId];
+    if (!sid) continue;
+    const f = state.manage.fetch[sid];
+    if (!f || f.taskId !== t.taskId) continue;
+    f.state = t.state;
+    f.progress = t.progress;
+    f.stage = t.stage || '';
+    f.message = t.message || '';
+    f.error = t.error || null;
+  }
+}
+
+/** manage 页可见且单源任务进度签名变化时才重渲染卡片（避免每 2s 无谓重建 DOM） */
+function renderManageTasks() {
+  if (state.tab !== 'manage' || state.data.manage == null) return;
+  const parts = Object.keys(state.manage.fetch).sort().map((k) => {
+    const f = state.manage.fetch[k];
+    return k + ':' + f.state + ':' + f.progress + ':' + (f.message || '') +
+      ':' + (f.error || '') + ':' + (f.sourceCount == null ? '' : f.sourceCount);
+  }).join('|');
+  if (parts === state.tasks.manageSig) return;
+  state.tasks.manageSig = parts;
+  renderManage();
+}
+
+function openTaskPanel() {
+  state.tasks.panelOpen = true;
+  el.taskPanel.hidden = false;
+  renderTaskPanel();
+}
+
+function closeTaskPanel() {
+  state.tasks.panelOpen = false;
+  el.taskPanel.hidden = true;
+  updateTaskToggle();
+}
+
+function toggleTaskPanel() {
+  if (state.tasks.panelOpen) closeTaskPanel();
+  else { openTaskPanel(); pollTasks(); }
+}
+
+/** 顶部「任务」按钮：红点计数 + 开合状态 */
+function updateTaskToggle() {
+  const active = (state.tasks.list || [])
+    .filter((t) => t.state === 'pending' || t.state === 'running').length;
+  el.taskRunDot.hidden = !active;
+  el.taskRunDot.textContent = active > 9 ? '9+' : String(active);
+  el.taskToggleBtn.classList.toggle('active', state.tasks.panelOpen);
+  el.taskToggleBtn.setAttribute('aria-expanded', String(state.tasks.panelOpen));
+}
+
+function renderTaskPanel() {
+  updateTaskToggle();
+  if (!state.tasks.panelOpen) return;                // 面板关闭时仅更新入口红点
+
+  const list = (state.tasks.list || []).filter((t) => !state.tasks.hidden[t.taskId]);
+  const active = list.filter((t) => t.state === 'pending' || t.state === 'running').length;
+  el.taskPanelCount.textContent = active ? active + ' 个进行中' : '空闲';
+
+  if (!list.length) {
+    el.taskList.innerHTML = '';
+    el.taskEmpty.hidden = false;
+    return;
+  }
+  el.taskEmpty.hidden = true;
+  el.taskList.innerHTML = list.map(taskItemHtml).join('');
+
+  if (state.tasks.highlight) {
+    const item = el.taskList.querySelector('.task-item[data-taskid="' + cssEscape(state.tasks.highlight) + '"]');
+    if (item) {
+      item.classList.add('flash');
+      item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      state.tasks.highlight = null;
+    }
+  }
+}
+
+/** 任务面板单条卡片 */
+function taskItemHtml(t) {
+  const meta = TASK_STATE_META[t.state] || { badge: 'badge-idle', text: t.state || '未知' };
+  const kind = TASK_KIND_LABEL[t.kind] || t.kind || '任务';
+  const pct = clampPct(t.progress);
+  const fillCls = t.state === 'running' ? 'is-running'
+    : t.state === 'failed' ? 'is-failed'
+    : t.state === 'cancelled' ? 'is-cancelled'
+    : t.state === 'pending' ? 'is-pending' : 'is-done';
+  const stage = [t.stage, t.message].filter(Boolean).map(esc).join(' · ') || '—';
+  const clearable = t.state === 'done' || t.state === 'failed' || t.state === 'cancelled';
+  const started = t.startedAt ? fmtTime(t.startedAt) : '';
+  const finished = t.finishedAt ? fmtTime(t.finishedAt) : '';
+  const detail = detailText(t.detail);
+
+  return '<div class="task-item is-' + esc(t.state) + '" data-taskid="' + esc(t.taskId) + '">' +
+    '<div class="task-item-head">' +
+      '<span class="task-label" title="' + esc(t.label || kind) + '">' + esc(t.label || kind) + '</span>' +
+      '<span class="chip">' + esc(kind) + '</span>' +
+      '<span class="badge ' + meta.badge + '">' + esc(meta.text) + '</span>' +
+      (clearable ? '<button type="button" class="task-clear" data-act="clear-task" data-id="' + esc(t.taskId) +
+        '" title="从面板移除（不影响服务端任务记录）" aria-label="清除该任务记录">×</button>' : '') +
+    '</div>' +
+    '<div class="task-progress-row">' +
+      '<div class="progress"><div class="progress-fill task-fill ' + fillCls + '" style="width:' + pct + '%"></div></div>' +
+      '<span class="task-pct">' + pct + '%</span>' +
+    '</div>' +
+    '<div class="task-stage" title="' + esc(stage) + '">' + esc(stage) + '</div>' +
+    (t.state === 'failed' && t.error
+      ? '<div class="task-err" title="' + esc(t.error) + '">' + esc(t.error) + '</div>' : '') +
+    (detail && t.state !== 'failed'
+      ? '<div class="task-detail" title="' + esc(detail) + '">' + esc(detail) + '</div>' : '') +
+    (started || finished
+      ? '<div class="task-time">' + esc(started) + (finished ? ' → ' + esc(finished) : '') + '</div>' : '') +
+    '</div>';
+}
+
+/** 面板任务列表点击委托：清除已完成 / 失败 / 取消的任务（仅本地隐藏） */
+function onTaskListClick(e) {
+  const btn = e.target.closest('button[data-act="clear-task"]');
+  if (!btn) return;
+  state.tasks.hidden[btn.dataset.id] = true;
+  renderTaskPanel();
 }
 
 /* ---------------- 自动刷新轮询 ---------------- */
 
 function poll() {
   if (!state.autoRefresh || document.hidden) return;
-  refreshStatus(true);                               // 控制操作期间也持续刷新状态
-  if (!state.busy && DATA_TABS.includes(state.tab)) {
+  refreshStatus(true);
+  if (DATA_TABS.includes(state.tab)) {
     LOADERS[state.tab]({ force: true, silent: true });
   }
 }
@@ -1385,35 +2226,23 @@ function poll() {
 /* ---------------- 事件绑定 ---------------- */
 
 function bindEvents() {
-  // 控制按钮
-  el.btnFetch.addEventListener('click', () => runControl(
-    el.btnFetch, API + '/fetch', { force: el.forceChk.checked }, '获取数据',
-    '正在获取数据…', '正在从各数据源抓取最新热点，请稍候',
-    (res) => {
-      markDirty('raw', 'sources');
-      toast('获取完成：' + (countOf(res.items) != null ? countOf(res.items) + ' 条' : '完成'));
-    }));
-  el.btnClean.addEventListener('click', () => runControl(
-    el.btnClean, API + '/clean', {}, '数据清洗',
-    '正在清洗数据…', '正在对原始数据进行去重、合并与标准化…',
-    (res) => {
-      markDirty('cleaned');
-      toast('清洗完成：' + (countOf(res.items) != null ? countOf(res.items) + ' 条' : '完成'));
-    }));
-  el.btnAi.addEventListener('click', () => runControl(
-    el.btnAi, API + '/ai', {}, 'AI 整理',
-    '正在 AI 整理…', 'AI 整理可能需要数分钟时间，请耐心等待，请勿关闭页面…',
-    (res) => {
-      markDirty('ai');
-      toast('AI 整理完成：共 ' + (countOf(res.total) != null ? countOf(res.total) + ' 条' : '—'));
-    }));
-  el.btnRunAll.addEventListener('click', () => runControl(
-    el.btnRunAll, API + '/run-all', { force: el.forceChk.checked }, '全流程',
-    '正在执行全流程…', '依次执行「获取 → 清洗 → AI 整理」，可能需要数分钟…',
-    () => {
-      markDirty('raw', 'cleaned', 'ai', 'sources');
-      toast('全流程执行完成');
-    }));
+  // 控制按钮：提交后台任务（立即返回 taskId，进度见「任务」面板，不锁页面）
+  el.btnFetch.addEventListener('click', () =>
+    submitTask('/fetch', { force: el.forceChk.checked }, '全量获取数据', el.btnFetch));
+  el.btnClean.addEventListener('click', () =>
+    submitTask('/clean', {}, '数据清洗', el.btnClean));
+  el.btnAi.addEventListener('click', () =>
+    submitTask('/ai', {}, 'AI 整理', el.btnAi));
+  el.btnRunAll.addEventListener('click', () =>
+    submitTask('/run-all', { force: el.forceChk.checked }, '全流程', el.btnRunAll));
+
+  // 后台任务面板：入口开合 / 关闭 / 清除任务 / 点击面板外自动收起
+  el.taskToggleBtn.addEventListener('click', toggleTaskPanel);
+  el.taskPanelClose.addEventListener('click', closeTaskPanel);
+  el.taskList.addEventListener('click', onTaskListClick);
+  document.addEventListener('click', (e) => {
+    if (state.tasks.panelOpen && !e.target.closest('.task-menu')) closeTaskPanel();
+  });
 
   // 自动刷新开关
   el.autoChk.addEventListener('change', () => {
@@ -1440,6 +2269,10 @@ function bindEvents() {
     state.aiCategory = e.target.value;
     renderAiCategory();
   });
+
+  // AI 整理详情：刷新 / 列表折叠与操作（事件委托）
+  byId('ai-runsRefresh').addEventListener('click', () => loadAiRuns({ force: true }));
+  byId('ai-runsList').addEventListener('click', onAiRunsListClick);
 
   // 配置保存
   byId('configSave').addEventListener('click', saveConfig);
@@ -1474,9 +2307,11 @@ function bindEvents() {
   // 错误横幅关闭
   el.bannerClose.addEventListener('click', hideBanner);
 
-  // 回到页面时立即刷新一次
+  // 回到页面时立即刷新一次（任务轮询不依赖自动刷新开关）
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && state.autoRefresh) poll();
+    if (document.hidden) return;
+    pollTasks();
+    if (state.autoRefresh) poll();
   });
 }
 
@@ -1492,6 +2327,7 @@ function init() {
 
   refreshStatus(false);
   setInterval(poll, POLL_INTERVAL);
+  pollTasks();                                       // 后台任务轮询（独立于自动刷新）
 }
 
 init();

@@ -19,6 +19,8 @@ from .config import DATA_DIR, config_manager
 RETENTION_PER_KIND = int(os.environ.get("HOTSPOT_RETENTION", "50"))
 # 禁用源数据备份保留份数（按备份时间，保留最近 N 份）
 DISABLED_RETENTION = int(os.environ.get("HOTSPOT_DISABLED_RETENTION", "5"))
+# AI 整理过程追踪保留份数
+AI_RUNS_RETENTION = int(os.environ.get("HOTSPOT_AI_RUNS_RETENTION", "50"))
 
 
 class Storage:
@@ -176,6 +178,66 @@ class Storage:
         if not files:
             return None
         return self._read(os.path.join(dir_path, files[-1]))
+
+    # ---------- AI 整理过程追踪（详情页：每次整理一个 run，按时间 ID） ----------
+
+    def _ai_runs_dir(self) -> str:
+        return os.path.join(self.data_dir, "ai_runs")
+
+    def save_ai_run(self, trace: dict[str, Any]) -> None:
+        """保存一次 AI 整理过程追踪（含失败现场），按 runId（时间戳）落盘。"""
+        run_dir = self._ai_runs_dir()
+        os.makedirs(run_dir, exist_ok=True)
+        run_id = str(trace.get("runId") or time.strftime("%Y%m%d-%H%M%S"))
+        self._write(os.path.join(run_dir, f"{run_id}.json"), trace)
+        self._prune_ai_runs()
+
+    def load_ai_run(self, run_id: str) -> dict[str, Any] | None:
+        safe = os.path.basename(run_id)
+        return self._read(os.path.join(self._ai_runs_dir(), f"{safe}.json"))
+
+    def list_ai_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """列出 AI 整理过程追踪（倒序），仅含概要字段（不含大 payload）。"""
+        run_dir = self._ai_runs_dir()
+        result: list[dict[str, Any]] = []
+        if not os.path.isdir(run_dir):
+            return result
+        for f in sorted(os.listdir(run_dir), reverse=True):
+            if not f.endswith(".json"):
+                continue
+            data = self._read(os.path.join(run_dir, f))
+            if not data:
+                continue
+            result.append({
+                "runId": data.get("runId", f[:-5]),
+                "startedAt": data.get("startedAt", 0),
+                "finishedAt": data.get("finishedAt", 0),
+                "status": data.get("status", "unknown"),
+                "model": data.get("model", ""),
+                "sourceItemCount": data.get("sourceItemCount", 0),
+                "total": data.get("total", 0),
+                "batchCount": data.get("batchCount", 0),
+                "error": data.get("error"),
+            })
+            if len(result) >= limit:
+                break
+        return result
+
+    def _prune_ai_runs(self) -> None:
+        run_dir = self._ai_runs_dir()
+        try:
+            files = sorted(
+                f for f in os.listdir(run_dir)
+                if f.endswith(".json") and not f.endswith(".tmp")
+            )
+        except OSError:
+            return
+        keep = max(1, AI_RUNS_RETENTION)
+        for old in files[:-keep]:
+            try:
+                os.remove(os.path.join(run_dir, old))
+            except OSError:
+                pass
 
 
 storage = Storage()

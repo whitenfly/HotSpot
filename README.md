@@ -32,10 +32,26 @@ docker compose up -d --build
 | `GET /api/hotspot/cleaned` | 最新清洗后数据                           |
 | `GET /api/hotspot/health`  | 健康检查                                 |
 
-控制接口（Web 页面调试用）：
+控制接口（Web 页面调试用，**全部后台异步执行**，返回 taskId 后经任务进度查询）：
 `POST /api/hotspot/fetch`（获取数据）、`POST /api/hotspot/clean`（清洗）、
 `POST /api/hotspot/ai`（AI 整理）、`POST /api/hotspot/run-all`（全流程）、
 `GET/PUT /api/hotspot/config`（配置）、`GET/PUT /api/hotspot/prompts/{name}`（提示词）。
+
+后台任务接口（需求：任务后台化 + 进度量化 + 多源并行）：
+`GET /api/hotspot/tasks`（任务列表，含进度 progress/stage/state）、
+`GET /api/hotspot/tasks/{id}`（单任务进度）、
+控制接口提交后返回 `{"ok":true,"taskId":"...","async":true}`，前端轮询进度；
+`fetch_all/clean/ai/run_all` 同一时刻仅运行一个（其余 409 冲突），
+单源获取 `POST /api/hotspot/sources/fetch/{id}` 可多源并行（快照合并串行，不互相覆盖）。
+
+AI 整理过程追踪接口（Web「AI 详情」标签页）：
+`GET /api/hotspot/ai-runs`（每次 AI 整理记录列表，按时间 ID 倒序）、
+`GET /api/hotspot/ai-runs/{runId}`（单次整理完整过程：每批输入原始数据/发送 payload/
+AI 原始返回/解析结果/终稿合并；成功与失败均记录，失败含错误现场，便于调试）、
+`POST /api/hotspot/ai-runs/{runId}/retry-batch`（单批重试：某批失败或想重新生成时
+只重跑该批，不必全部重来；后台任务执行）、
+`POST /api/hotspot/ai-runs/{runId}/finalize`（续跑终稿合并：失败批次重试成功后，
+基于全部成功批重新做跨批合并并产出榜单；后台任务执行）。
 
 数据源管理接口（Web「数据源管理」标签页）：
 `GET/POST /api/hotspot/sources/config`（列表/新增）、
@@ -99,6 +115,9 @@ HotSpot/
 - **启用/禁用数据隔离**：卡片开关禁用某源时，自动从最新原始快照剔除该源数据（不再进入后续清洗/AI），并将该源数据按时间戳备份到 `data/disabled/{源id}/`（保留最近 5 份，含获取时间）；重新启用时自动从备份恢复该源数据（若快照中已有更新的该源数据则不覆盖），无需重新抓取
 - **增删改查**：Web 页面新增/编辑/删除/启停任一数据源（卡片上的开关可即时启停）
 - **领域筛选**：Web「数据源管理」页可按领域筛选数据源（时政/社会/财经/科技/AI/游戏等 24 类）
+- **后台任务与进度**：数据获取/清洗/AI整理/全流程均后台执行（可关闭面板继续浏览），
+  顶部「任务」面板实时显示进度条（fetch 逐源进度、AI 按批次进度、全流程分阶段加权进度）；
+  多个数据源可同时「单独获取」异步并行
 
 ### RSSHub 数据源与实例
 

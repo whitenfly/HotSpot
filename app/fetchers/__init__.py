@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ..models import RawItem, RawSnapshot, SourceStatus, now_ms
 from ..template_engine import extract_entries, validate_template
@@ -236,25 +236,42 @@ def _stable_id(title: str, url: str) -> str:
     return hashlib.md5(title.encode("utf-8")).hexdigest()[:10]
 
 
-async def fetch_all_sources(sources_cfg: list[dict], force: bool = False) -> RawSnapshot:
-    """按配置抓取全部启用的数据源，返回一次完整快照。"""
+async def fetch_all_sources(
+    sources_cfg: list[dict],
+    force: bool = False,
+    progress_cb: Callable[[int, str | None, str], Awaitable[None]] | None = None,
+    max_concurrency: int = 4,
+) -> RawSnapshot:
+    """按配置抓取全部启用的数据源，返回一次完整快照。
+
+    并行化（需求：多个数据源单独获取异步可同时进行）：默认 4 并发抓取，
+    progress_cb(progress, stage, message) 上报逐源完成进度。
+    """
+    enabled = [s for s in sources_cfg if s.get("enabled", True)]
+    total = len(enabled)
     items: list[RawItem] = []
     statuses: list[SourceStatus] = []
-    delay = float(_scheduler_delay())
+    done_count = 0
+    sem = asyncio.Semaphore(max_concurrency)
 
-    for source_cfg in sources_cfg:
-        if not source_cfg.get("enabled", True):
-            continue
-        src_items, status = await fetch_source(source_cfg, force=force)
+    async def _fetch_one(source_cfg: dict) -> tuple[list[RawItem], SourceStatus]:
+        async with sem:
+            return await fetch_source(source_cfg, force=force)
+
+    async def _collect(source_cfg: dict) -> None:
+        nonlocal done_count
+        src_items, status = await _fetch_one(source_cfg)
         items.extend(src_items)
         statuses.append(status)
-        if status.durationMs > 0 and delay > 0:
-            await asyncio.sleep(delay)  # 源间间隔，防止同一时段集中请求被风控
+        done_count += 1
+        if progress_cb:
+            pct = int(done_count / total * 100) if total else 100
+            await progress_cb(pct, None, f"获取 {status.sourceName} 完成（{done_count}/{total}）")
+
+    if progress_cb:
+        await progress_cb(0, "获取数据", f"开始获取 {total} 个数据源（并发 {max_concurrency}）")
+
+    if total:
+        await asyncio.gather(*(_collect(s) for s in enabled))
 
     return RawSnapshot(items=items, sources=statuses)
-
-
-def _scheduler_delay() -> float:
-    from ..config import config_manager
-
-    return float(config_manager.get_scheduler().get("requestDelaySeconds", 0.5))

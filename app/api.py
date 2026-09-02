@@ -115,44 +115,149 @@ async def get_sources():
     return JSONResponse({"updatedAt": (latest or {}).get("fetchedAt", 0), "sources": sources})
 
 
-# ============ 控制 API ============
+# ============ 控制 API（后台任务化：立即返回 taskId，进度经 /tasks 查询） ============
+
+from .tasks import task_manager
+
+
+async def _submit_task(kind: str, label: str, factory, source_id: str | None = None):
+    """提交任务；若流水线任务已在运行则返回 409。"""
+    if kind in ("fetch_all", "clean", "ai", "run_all"):
+        running = await task_manager.running_pipeline()
+        if running:
+            return None, running
+    task_id = await task_manager.submit(kind, label, factory, source_id=source_id)
+    return task_id, None
+
 
 @app.post("/api/hotspot/fetch")
 async def api_fetch(force: bool = Body(default=False, embed=True)):
-    try:
-        snapshot = await run_fetch(force=force)
-        return {"ok": True, "runId": snapshot.runId,
-                "items": len(snapshot.items), "sources": len(snapshot.sources)}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    """后台触发全量获取（立即返回，进度经任务查询）。"""
+    task_id, conflict = await _submit_task(
+        "fetch_all", "全量获取数据",
+        lambda cb: run_fetch(force=force, progress_cb=cb),
+    )
+    if conflict:
+        return JSONResponse({"ok": False, "error": "已有任务在运行，请稍后再试",
+                             "conflictTaskId": conflict["taskId"]}, status_code=409)
+    return {"ok": True, "taskId": task_id, "async": True}
 
 
 @app.post("/api/hotspot/clean")
 async def api_clean():
-    try:
-        cleaned = await run_clean()
-        return {"ok": True, "runId": cleaned.get("runId"), "items": len(cleaned.get("items", []))}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    task_id, conflict = await _submit_task(
+        "clean", "数据清洗",
+        lambda cb: run_clean(progress_cb=cb),
+    )
+    if conflict:
+        return JSONResponse({"ok": False, "error": "已有任务在运行，请稍后再试",
+                             "conflictTaskId": conflict["taskId"]}, status_code=409)
+    return {"ok": True, "taskId": task_id, "async": True}
 
 
 @app.post("/api/hotspot/ai")
 async def api_ai():
-    """触发 AI 整理：自动存储 + 发布到 API（需求六-2）。"""
-    try:
-        result = await run_ai()
-        return {"ok": True, "runId": result.get("runId"), "total": result.get("total")}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    """后台触发 AI 整理：自动存储 + 发布到 API（需求六-2，进度经任务查询）。"""
+    task_id, conflict = await _submit_task(
+        "ai", "AI 整理",
+        lambda cb: run_ai(progress_cb=cb),
+    )
+    if conflict:
+        return JSONResponse({"ok": False, "error": "已有任务在运行，请稍后再试",
+                             "conflictTaskId": conflict["taskId"]}, status_code=409)
+    return {"ok": True, "taskId": task_id, "async": True}
 
 
 @app.post("/api/hotspot/run-all")
 async def api_run_all(force: bool = Body(default=False, embed=True)):
-    try:
-        await pipeline_run_all(force=force)
-        return {"ok": True}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    task_id, conflict = await _submit_task(
+        "run_all", "全流程（获取+清洗+AI）",
+        lambda cb: pipeline_run_all(force=force, progress_cb=cb),
+    )
+    if conflict:
+        return JSONResponse({"ok": False, "error": "已有任务在运行，请稍后再试",
+                             "conflictTaskId": conflict["taskId"]}, status_code=409)
+    return {"ok": True, "taskId": task_id, "async": True}
+
+
+# ============ 任务查询 API（进度条轮询） ============
+
+@app.get("/api/hotspot/tasks")
+async def api_list_tasks(limit: int = 30):
+    tasks = await task_manager.list_tasks(limit=limit)
+    return {"tasks": tasks, "running": await task_manager.running_pipeline()}
+
+
+@app.get("/api/hotspot/tasks/{task_id}")
+async def api_get_task(task_id: str):
+    task = await task_manager.get_task(task_id)
+    if task is None:
+        raise HTTPException(404, "任务不存在")
+    return task
+
+
+# ============ AI 整理过程追踪 API（详情页） ============
+
+@app.get("/api/hotspot/ai-runs")
+async def api_list_ai_runs(limit: int = 50):
+    """AI 整理过程追踪列表（按时间倒序，概要字段）。"""
+    return {"runs": storage.list_ai_runs(limit=limit)}
+
+
+@app.get("/api/hotspot/ai-runs/{run_id}")
+async def api_get_ai_run(run_id: str):
+    """单次 AI 整理完整过程追踪（含每批输入/发送payload/AI返回/解析/终稿/错误）。"""
+    run = storage.load_ai_run(run_id)
+    if run is None:
+        raise HTTPException(404, "AI 整理记录不存在")
+    return run
+
+
+@app.post("/api/hotspot/ai-runs/{run_id}/retry-batch")
+async def api_retry_ai_batch(run_id: str, payload: dict = Body(...)):
+    """单批重试（需求：某批失败/想重新生成时只重跑该批，不必全部重来）。
+
+    后台任务执行；同 run 的重试/续跑互斥。
+    """
+    from .pipeline import run_ai_batch_retry
+
+    batch_index = int(payload.get("batchIndex", 0))
+    run = storage.load_ai_run(run_id)
+    if run is None:
+        raise HTTPException(404, "AI 整理记录不存在")
+    running = await task_manager.running_source_fetch(run_id)  # 复用同 key 互斥
+    if running:
+        return JSONResponse({"ok": False, "error": "该整理记录已有重试/续跑任务在运行",
+                             "conflictTaskId": running["taskId"]}, status_code=409)
+    task_id = await task_manager.submit(
+        "ai_batch", f"重试批次 {batch_index}",
+        lambda cb: run_ai_batch_retry(run_id, batch_index, progress_cb=cb),
+        source_id=run_id,
+    )
+    return {"ok": True, "taskId": task_id, "async": True}
+
+
+@app.post("/api/hotspot/ai-runs/{run_id}/finalize")
+async def api_finalize_ai_run(run_id: str):
+    """续跑终稿合并（需求：失败批次重试成功后，或想基于当前结果重新合并时产出榜单）。
+
+    后台任务执行；同 run 的重试/续跑互斥。
+    """
+    from .pipeline import run_ai_finalize
+
+    run = storage.load_ai_run(run_id)
+    if run is None:
+        raise HTTPException(404, "AI 整理记录不存在")
+    running = await task_manager.running_source_fetch(run_id)
+    if running:
+        return JSONResponse({"ok": False, "error": "该整理记录已有重试/续跑任务在运行",
+                             "conflictTaskId": running["taskId"]}, status_code=409)
+    task_id = await task_manager.submit(
+        "ai_finalize", f"续跑终稿 {run_id}",
+        lambda cb: run_ai_finalize(run_id, progress_cb=cb),
+        source_id=run_id,
+    )
+    return {"ok": True, "taskId": task_id, "async": True}
 
 
 # ============ 配置与提示词 API ============
@@ -350,20 +455,27 @@ async def test_source_endpoint(source_id: str):
 
 @app.post("/api/hotspot/sources/fetch/{source_id}")
 async def fetch_source_endpoint(source_id: str, force: bool = Body(default=True, embed=True)):
-    """单源单独获取，并与最近一次快照部分合并（只更新该源数据部分）。"""
+    """单源单独获取，与最近一次快照部分合并（只更新该源数据部分）。
+
+    后台任务化：立即返回 taskId；多个数据源可同时提交、异步并行获取
+    （网络请求并行，快照合并经 snapshot_lock 串行），进度经 /tasks 查询。
+    """
     from .pipeline import run_fetch_source
 
-    try:
-        snapshot = await run_fetch_source(source_id, force=force)
-        return {
-            "ok": True,
-            "runId": snapshot.runId,
-            "items": len(snapshot.items),
-            "mergedSource": source_id,
-            "partial": snapshot.extra.get("partial", False),
-        }
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    source = sources_manager.get_source(source_id)
+    if source is None:
+        raise HTTPException(404, "数据源不存在")
+    running_same = await task_manager.running_source_fetch(source_id)
+    if running_same:
+        return JSONResponse({"ok": False, "error": "该数据源已有获取任务在运行",
+                             "conflictTaskId": running_same["taskId"]}, status_code=409)
+    task_id = await task_manager.submit(
+        "fetch_source",
+        f"单独获取 {source.get('name', source_id)}",
+        lambda cb: run_fetch_source(source_id, force=force, progress_cb=cb),
+        source_id=source_id,
+    )
+    return {"ok": True, "taskId": task_id, "sourceId": source_id, "async": True}
 
 
 def _restore_source_secrets(existing: dict, incoming: dict) -> dict:

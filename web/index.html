@@ -38,6 +38,27 @@
         <span class="switch-track"><span class="switch-knob"></span></span>
         <span class="switch-label">自动刷新</span>
       </label>
+
+      <!-- 后台任务：入口按钮（红点计数）+ 下拉进度面板 -->
+      <div class="task-menu">
+        <button type="button" class="btn btn-sm task-toggle" id="taskToggleBtn" aria-haspopup="dialog" aria-expanded="false" title="查看后台任务进度">
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h13" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+          <span>任务</span>
+          <span id="taskRunDot" class="task-dot" hidden>0</span>
+        </button>
+        <div id="taskPanel" class="task-panel" hidden role="dialog" aria-label="后台任务列表">
+          <div class="task-panel-head">
+            <h3>后台任务</h3>
+            <span id="taskPanelCount" class="chip">空闲</span>
+            <button type="button" id="taskPanelClose" class="task-panel-close" aria-label="关闭任务面板">×</button>
+          </div>
+          <div id="taskList" class="task-list"></div>
+          <div id="taskEmpty" class="task-empty" hidden>
+            <div class="empty-title">暂无任务记录</div>
+            <div class="empty-hint">提交「获取数据 / 数据清洗 / AI整理 / 全流程」，或在数据源管理页点击「单独获取」后，任务将在后台执行并在此展示进度</div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -54,6 +75,7 @@
       <a class="tab active" href="#raw" data-tab="raw">原始数据预览</a>
       <a class="tab" href="#cleaned" data-tab="cleaned">清洗后数据预览</a>
       <a class="tab" href="#ai" data-tab="ai">AI整理结果</a>
+      <a class="tab" href="#ai-runs" data-tab="ai-runs">AI 详情</a>
       <a class="tab" href="#sources" data-tab="sources">数据源可用性</a>
       <a class="tab" href="#config" data-tab="config">配置</a>
       <a class="tab" href="#prompts" data-tab="prompts">提示词</a>
@@ -147,6 +169,20 @@
       </div>
       <div id="aiCatList" class="rank-list"></div>
     </div>
+  </section>
+
+  <!-- ==================== AI 整理详情（ai-runs） ==================== -->
+  <section id="panel-ai-runs" class="panel">
+    <div class="panel-head">
+      <h2>AI 整理详情</h2>
+      <div class="panel-tools">
+        <div id="ai-runsStats" class="stats"></div>
+        <button type="button" class="btn btn-sm" id="ai-runsRefresh"><span class="btn-spin" aria-hidden="true"></span><span>刷新</span></button>
+      </div>
+    </div>
+    <p class="hint">可视化每次 AI 整理的完整调用过程：点击记录展开详情，按批次查看「输入原始数据 → 发送 payload → AI 返回 → 解析结果」及终稿合并阶段；整理失败同样完整展示。大块 payload 默认收起，点击标题行展开 / 收起，运行中的整理会自动刷新。</p>
+    <div id="ai-runsState" class="tab-state" hidden></div>
+    <div id="ai-runsList" class="run-list" hidden></div>
   </section>
 
   <!-- ==================== 数据源可用性 ==================== -->
@@ -349,6 +385,7 @@
     <div class="api-links">
       <a href="/api/hotspot/publish" target="_blank" rel="noopener">/api/hotspot/publish</a>
       <a href="/api/hotspot/ai" target="_blank" rel="noopener">/api/hotspot/ai</a>
+      <a href="/api/hotspot/ai-runs?limit=50" target="_blank" rel="noopener">/api/hotspot/ai-runs</a>
       <a href="/api/hotspot/sources" target="_blank" rel="noopener">/api/hotspot/sources</a>
       <a href="/api/hotspot/raw" target="_blank" rel="noopener">/api/hotspot/raw</a>
       <a href="/api/hotspot/cleaned" target="_blank" rel="noopener">/api/hotspot/cleaned</a>
@@ -356,15 +393,6 @@
     <p class="footer-note">Firefly 热点榜单模块消费 <code>/api/hotspot/publish</code> 或 <code>/api/hotspot/ai</code></p>
   </div>
 </footer>
-
-<!-- ==================== 全局遮罩（控制操作进行中） ==================== -->
-<div id="overlay" class="overlay" hidden>
-  <div class="overlay-card" role="status">
-    <div class="spinner spinner-lg" aria-hidden="true"></div>
-    <div id="overlayText" class="overlay-text">处理中…</div>
-    <div id="overlayHint" class="overlay-hint"></div>
-  </div>
-</div>
 
 <!-- 轻量提示（操作成功反馈） -->
 <div id="toastBox" class="toast-box" aria-live="polite"></div>

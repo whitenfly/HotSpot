@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -48,8 +48,12 @@ async def chat_completion(
     system_prompt: str,
     user_payload: str,
     ai_cfg: dict[str, Any],
-) -> dict[str, Any]:
-    """调用 OpenAI 兼容 /chat/completions，返回解析后的 JSON dict。"""
+    return_raw: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], str]:
+    """调用 OpenAI 兼容 /chat/completions，返回解析后的 JSON dict。
+
+    return_raw=True 时返回 (parsed_dict, raw_content_text)，供过程追踪记录原始返回。
+    """
     base_url = (ai_cfg.get("baseUrl") or "https://api.deepseek.com/v1").rstrip("/")
     api_key = ai_cfg.get("apiKey") or ""
     if not api_key:
@@ -90,9 +94,12 @@ async def chat_completion(
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         raise AIError(f"AI 输出 JSON 解析失败（可能是输出被截断）：{exc}\n---\n{content[:300]}") from exc
+    if return_raw:
+        return parsed, content
+    return parsed
 
 
 # ============ 输入构造 ============
@@ -143,6 +150,65 @@ def parse_batch_output(raw: dict[str, Any]) -> list[dict[str, Any]]:
             "heat": heat,
         })
     return groups
+
+
+def enrich_groups(
+    parsed: list[dict[str, Any]],
+    batch: list[dict[str, Any]],
+    index_offset: int,
+    group_id_base: int,
+) -> list[dict[str, Any]]:
+    """为解析出的组补充 groupId/sources/rawItemIds 等（在原位 enrich）。
+
+    group_id_base：本批第一个组的全局编号（= 已有组总数），保证跨批 groupId 全局唯一。
+    """
+    for g in parsed:
+        g["groupId"] = f"g{group_id_base}"
+        group_id_base += 1
+        picked = [batch[i - index_offset] for i in g["inputIndexes"]
+                  if index_offset <= i < index_offset + len(batch)]
+        g["sources"] = sorted({p["source"] for p in picked})
+        g["sourceNames"] = _source_names(g["sources"])
+        g["rawItemIds"] = [p["id"] for p in picked]
+        g["rawHeats"] = {p["source"]: p["heat"] for p in picked if p["heat"] is not None}
+        published_times = [p["publishedAt"] for p in picked if p.get("publishedAt")]
+        g["publishedAt"] = min(published_times) if published_times else None
+    return parsed
+
+
+async def process_single_batch(
+    batch: list[dict[str, Any]],
+    index_offset: int,
+    group_id_base: int,
+    ai_cfg: dict[str, Any],
+    trace_entry: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """独立重跑单个批次（需求：单批失败可单独重试）。
+
+    - batch：该批输入条目（与第一次送入时一致的字段结构）
+    - index_offset：该批在整份输入中的起始索引（保证 inputIndexes 全局编号一致）
+    - group_id_base：该批第一组的全局编号（= 重试前整次整理已成功组的数量，保证 groupId 唯一）
+    - trace_entry：该批的 trace 记录（原地更新 status/aiResponse/parsedGroups/error）
+    """
+    system_prompt = config_manager.get_prompt("system_prompt") or "你是热点数据整理专家。"
+    enable_content = bool(ai_cfg.get("enableFetchContent", False))
+    user_payload = build_batch_input(batch, index_offset, enable_content)
+    trace_entry["sentPayload"] = user_payload
+    raw, raw_text = await chat_completion(system_prompt, user_payload, ai_cfg, return_raw=True)
+    parsed = parse_batch_output(raw)
+    if not parsed:
+        trace_entry["status"] = "error"
+        trace_entry["error"] = "AI 输出中没有有效条目"
+        trace_entry["aiResponse"] = raw_text
+        raise AIError(f"批次 {trace_entry.get('batchIndex', '?')} AI 输出中没有有效条目")
+    enrich_groups(parsed, batch, index_offset, group_id_base)
+    trace_entry.update({
+        "status": "ok",
+        "aiResponse": raw_text,
+        "parsedGroups": parsed,
+        "error": None,
+    })
+    return parsed
 
 
 def build_finalize_input(groups: list[dict[str, Any]]) -> str:
@@ -199,11 +265,27 @@ def _union_categories(groups: list[dict[str, Any]]) -> list[str]:
 
 # ============ 主流程 ============
 
-async def organize(cleaned: CleanedSnapshot | dict) -> AiSnapshot:
-    """AI 整理主流程：分批 -> 批内分类/合并/摘要 -> 终稿跨批合并/统一热度 -> 榜单。"""
+async def organize(
+    cleaned: CleanedSnapshot | dict,
+    progress_cb: Callable[[int, str | None, str], Awaitable[None]] | None = None,
+    trace: dict[str, Any] | None = None,
+) -> AiSnapshot:
+    """AI 整理主流程：分批 -> 批内分类/合并/摘要 -> 终稿跨批合并/统一热度 -> 榜单。
+
+    progress_cb(progress, stage, message) 上报批处理进度（0-100），供后台任务进度条展示。
+    trace（可选 dict）为过程追踪收集器：记录每批的输入条目/发送payload/AI原始返回/解析结果，
+    以及终稿阶段输入输出；由调用方（pipeline）负责落盘供详情页可视化。
+    """
+    if trace is not None:
+        trace.setdefault("status", "running")
+        trace.setdefault("model", config_manager.get_ai().get("model", ""))
+        trace.setdefault("batches", [])
     if isinstance(cleaned, dict):
         cleaned = CleanedSnapshot.model_validate(cleaned)
     ai_cfg = config_manager.get_ai()
+    if trace is not None:
+        trace["cleanedFromRunId"] = cleaned.runId
+        trace.setdefault("sourceItemCount", len(cleaned.items))
 
     # 输入裁剪
     items = cleaned.items
@@ -213,6 +295,8 @@ async def organize(cleaned: CleanedSnapshot | dict) -> AiSnapshot:
         items = sorted(items, key=lambda it: it.heat if it.heat is not None else -1, reverse=True)[:max_items]
 
     if not items:
+        if progress_cb:
+            await progress_cb(100, "AI 整理", "无条目可整理")
         return AiSnapshot(
             cleanedFromRunId=cleaned.runId,
             model=ai_cfg.get("model", ""),
@@ -223,6 +307,10 @@ async def organize(cleaned: CleanedSnapshot | dict) -> AiSnapshot:
     finalize_prompt = config_manager.get_prompt("finalize_prompt") or (
         "请对给定热点条目做跨批合并与热度归一化，输出 finalItems。"
     )
+    # 记录发送给 AI 的系统提示词（每批都携带同一份 system prompt，trace 顶层存一份即可）
+    if trace is not None:
+        trace["systemPrompt"] = system_prompt
+        trace["finalizePrompt"] = finalize_prompt
 
     # 分批（自适应 batchSize 防止超上下文窗口）
     batch_size = int(ai_cfg.get("batchSize", 60))
@@ -252,42 +340,77 @@ async def organize(cleaned: CleanedSnapshot | dict) -> AiSnapshot:
 
     groups: list[dict[str, Any]] = []
     index_offset = 0
+    total_batches = len(batches)
     for batch_index, batch in enumerate(batches):
+        if progress_cb:
+            await progress_cb(
+                int(batch_index / total_batches * 80),
+                "AI 整理",
+                f"分批处理 {batch_index + 1}/{total_batches}（每批 ≤{batch_size} 条）",
+            )
+        # 调用前先占位 trace 条目（含该批 inputOffset/sentPayload），失败也留现场供单批重试
+        trace_entry: dict[str, Any] | None = None
+        if trace is not None:
+            trace_entry = {
+                "batchIndex": batch_index + 1,
+                "inputOffset": index_offset,
+                "inputItemCount": len(batch),
+                "inputItems": [{k: item[k] for k in ("id", "title", "url", "source", "domain", "heat", "summary", "publishedAt")
+                                if k in item} for item in batch],
+                "status": "running",
+            }
+            trace["batches"].append(trace_entry)
+
         user_payload = build_batch_input(batch, index_offset, enable_content)
+        if trace_entry is not None:
+            trace_entry["sentPayload"] = user_payload
         est_input = estimate_tokens(system_prompt) + estimate_tokens(user_payload)
         if est_input + max_tokens > context_window:
+            if trace_entry is not None:
+                trace_entry["status"] = "error"
+                trace_entry["error"] = f"预估输入 {est_input} tokens 超过上下文窗口 {context_window}"
             raise AIError(
                 f"批次 {batch_index + 1} 预估输入 {est_input} tokens + 输出 {max_tokens} "
                 f"超过上下文窗口 {context_window}。请调大 contextWindow 或调小 batchSize。"
             )
-        raw = await chat_completion(system_prompt, user_payload, ai_cfg)
+        raw, raw_text = await chat_completion(system_prompt, user_payload, ai_cfg, return_raw=True)
         parsed = parse_batch_output(raw)
         if not parsed:
+            if trace_entry is not None:
+                trace_entry["status"] = "error"
+                trace_entry["error"] = "AI 输出中没有有效条目"
+                trace_entry["aiResponse"] = raw_text
             raise AIError(f"批次 {batch_index + 1} AI 输出中没有有效条目，请检查提示词与输入。")
-        for g in parsed:
-            g["groupId"] = f"g{len(groups)}"
-            picked = [batch[i - index_offset] for i in g["inputIndexes"]
-                      if index_offset <= i < index_offset + len(batch)]
-            g["sources"] = sorted({p["source"] for p in picked})
-            g["sourceNames"] = _source_names(g["sources"])
-            g["rawItemIds"] = [p["id"] for p in picked]
-            g["rawHeats"] = {p["source"]: p["heat"] for p in picked if p["heat"] is not None}
-            published_times = [p["publishedAt"] for p in picked if p.get("publishedAt")]
-            g["publishedAt"] = min(published_times) if published_times else None
-            groups.append(g)
+        group_base = len(groups)
+        enrich_groups(parsed, batch, index_offset, group_base)
+        groups.extend(parsed)
+        if trace_entry is not None:
+            trace_entry.update({
+                "status": "ok",
+                "aiResponse": raw_text,
+                "parsedGroups": parsed,
+            })
         index_offset += len(batch)
         await asyncio.sleep(0.2)  # 批次间轻微间隔
 
     # 终稿：跨批合并 + 统一热度
+    if progress_cb:
+        await progress_cb(85, "AI 整理", "跨批合并与热度归一化…")
     if len(groups) > 1:
         finalize_input = build_finalize_input(groups)
         est_in = estimate_tokens(finalize_prompt) + estimate_tokens(finalize_input)
         if est_in + max_tokens > context_window:
             raise AIError(f"终稿请求预估超上下文窗口（{est_in + max_tokens} > {context_window}），请调小 maxItems 或调大 contextWindow。")
-        raw_final = await chat_completion(finalize_prompt, finalize_input, ai_cfg)
+        raw_final, raw_final_text = await chat_completion(finalize_prompt, finalize_input, ai_cfg, return_raw=True)
         finals = parse_finalize_output(raw_final, groups)
         if not finals:
             raise AIError("终稿合并 AI 输出为空，请检查 finalize_prompt。")
+        if trace is not None:
+            trace["finalize"] = {
+                "sentPayload": finalize_input,
+                "aiResponse": raw_final_text,
+                "parsedFinals": finals,
+            }
     else:
         finals = [{
             "groups": groups,
@@ -297,6 +420,12 @@ async def organize(cleaned: CleanedSnapshot | dict) -> AiSnapshot:
             "summary": groups[0]["summary"],
             "heat": groups[0]["heat"],
         }]
+        if trace is not None:
+            trace["finalize"] = {"note": "单批处理，无需跨批合并终稿", "parsedFinals": finals}
+    if progress_cb:
+        await progress_cb(95, "AI 整理", "生成榜单…")
+    if trace is not None:
+        trace["batchCount"] = total_batches
 
     return build_snapshot(cleaned, ai_cfg, finals)
 
@@ -403,3 +532,89 @@ def _source_names(source_ids: list[str]) -> list[str]:
     sources = config_manager.get_sources()
     by_id = {s["id"]: s.get("name", s["id"]) for s in sources}
     return [by_id.get(sid, sid) for sid in source_ids]
+
+
+def batch_input_from_trace(trace_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """从 trace 批次记录恢复重试所需的输入条目（字段结构与原 batch 一致）。"""
+    batch: list[dict[str, Any]] = []
+    for item in trace_entry.get("inputItems", []):
+        batch.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "source": item.get("source", ""),
+            "domain": item.get("domain"),
+            "heat": item.get("heat"),
+            "summary": item.get("summary"),
+            "id": item.get("id", ""),
+            "publishedAt": item.get("publishedAt"),
+        })
+    return batch
+
+
+def count_ok_groups(trace: dict[str, Any], up_to_batch_index: int | None = None) -> int:
+    """统计 trace 中 status=ok 批次解析出的组总数（用于重试批次的 groupId 偏移）。
+
+    up_to_batch_index 指定时仅统计该批之前的成功批（单批重试需保持重试前编号稳定）。
+    """
+    total = 0
+    for b in trace.get("batches", []):
+        if up_to_batch_index is not None and b.get("batchIndex", 1) >= up_to_batch_index:
+            continue
+        if b.get("status") == "ok":
+            total += len(b.get("parsedGroups") or [])
+    return total
+
+
+def collect_ok_groups(trace: dict[str, Any]) -> list[dict[str, Any]]:
+    """按批次顺序收集 trace 中所有成功批的解析组（供续跑终稿合并）。"""
+    groups: list[dict[str, Any]] = []
+    for b in trace.get("batches", []):
+        if b.get("status") != "ok":
+            continue
+        for g in b.get("parsedGroups") or []:
+            groups.append(g)
+    return groups
+
+
+async def finalize_groups(
+    groups: list[dict[str, Any]],
+    ai_cfg: dict[str, Any],
+    trace_finalize: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """对已有组做终稿跨批合并（需求：重试失败批次后/对成功批次重新合并时复用）。
+
+    trace_finalize 可选：非空时原地记录 发送payload/AI返回/解析结果 供续跑 trace。
+    """
+    finalize_prompt = config_manager.get_prompt("finalize_prompt") or (
+        "请对给定热点条目做跨批合并与热度归一化，输出 finalItems。"
+    )
+    finals: list[dict[str, Any]]
+    if len(groups) > 1:
+        finalize_input = build_finalize_input(groups)
+        max_tokens = int(ai_cfg.get("maxTokens", 8192))
+        context_window = int(ai_cfg.get("contextWindow", 65536))
+        est_in = estimate_tokens(finalize_prompt) + estimate_tokens(finalize_input)
+        if est_in + max_tokens > context_window:
+            raise AIError(f"终稿请求预估超上下文窗口（{est_in + max_tokens} > {context_window}），请调小 maxItems 或调大 contextWindow。")
+        raw_final, raw_final_text = await chat_completion(finalize_prompt, finalize_input, ai_cfg, return_raw=True)
+        finals = parse_finalize_output(raw_final, groups)
+        if not finals:
+            raise AIError("终稿合并 AI 输出为空，请检查 finalize_prompt。")
+        if trace_finalize is not None:
+            trace_finalize.update({
+                "sentPayload": finalize_input,
+                "aiResponse": raw_final_text,
+                "parsedFinals": finals,
+            })
+    else:
+        finals = [{
+            "groups": groups,
+            "title": groups[0]["title"],
+            "url": groups[0]["url"],
+            "categories": groups[0]["categories"],
+            "summary": groups[0]["summary"],
+            "heat": groups[0]["heat"],
+        }]
+        if trace_finalize is not None:
+            trace_finalize.update({"note": "单组处理，无需跨批合并终稿", "parsedFinals": finals})
+    return finals
